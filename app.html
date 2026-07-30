@@ -1,0 +1,422 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Concourse</title>
+<style>
+  /* ---------------------------------------------------------------------------
+     Trainyard design-system tokens (extracted from tokens/design-tokens.json +
+     src/styles/globals.css). Hardcoding hex elsewhere is a governance violation;
+     everything below references these variables.
+  --------------------------------------------------------------------------- */
+  :root {
+    /* Fleet brand + status palette (theme-independent) */
+    --primary: #2BAEE4;
+    --purple-accent: #5A4FCF;
+    --fleet-gold: #D4AF37;
+    --color-success: #22c55e;
+    --color-warning: #f59e0b;
+    --color-error: #ef4444;
+    --color-muted: #6b7280;
+
+    /* shadcn semantic tokens — HSL triples, wrapped at use with hsl() */
+    --background: 0 0% 100%;
+    --foreground: 0 0% 9%;
+    --card: 0 0% 100%;
+    --card-foreground: 0 0% 9%;
+    --muted: 0 0% 96%;
+    --muted-foreground: 0 0% 45%;
+    --border: 0 0% 90%;
+    --secondary: 0 0% 96%;
+    --ring: 198 76% 53%;
+
+    /* Typography */
+    --font-sans: 'Inter', ui-sans-serif, system-ui, sans-serif;
+    --font-display: 'Space Grotesk', 'Inter', ui-sans-serif, system-ui, sans-serif;
+    --font-mono: 'JetBrains Mono', ui-monospace, monospace;
+    --text-xs: 0.75rem;
+    --text-sm: 0.875rem;
+    --text-base: 1rem;
+    --text-lg: 1.125rem;
+    --text-xl: 1.25rem;
+    --text-2xl: 1.5rem;
+    --text-3xl: 1.875rem;
+
+    /* Spacing + radii */
+    --space-xs: 0.25rem;
+    --space-sm: 0.5rem;
+    --space-md: 1rem;
+    --space-lg: 1.5rem;
+    --space-xl: 2rem;
+    --space-2xl: 3rem;
+    --radius-md: 0.5rem;
+    --radius-lg: 0.75rem;
+    --radius-xl: 1rem;
+    --radius-full: 9999px;
+    --focus-ring: 0 0 0 3px var(--primary);
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --background: 240 10% 4%;
+      --foreground: 0 0% 98%;
+      --card: 240 6% 8%;
+      --card-foreground: 0 0% 98%;
+      --muted: 240 4% 16%;
+      --muted-foreground: 240 5% 65%;
+      --border: 240 4% 16%;
+      --secondary: 240 4% 16%;
+    }
+  }
+
+  /* Fonts packaged with the app, served same-origin by the host (no CDN). */
+  @font-face { font-family:'Inter'; font-style:normal; font-weight:400; font-display:swap; src:url('/fonts/inter-latin-400-normal.woff2') format('woff2'); }
+  @font-face { font-family:'Inter'; font-style:normal; font-weight:500; font-display:swap; src:url('/fonts/inter-latin-500-normal.woff2') format('woff2'); }
+  @font-face { font-family:'Inter'; font-style:normal; font-weight:600; font-display:swap; src:url('/fonts/inter-latin-600-normal.woff2') format('woff2'); }
+  @font-face { font-family:'Inter'; font-style:normal; font-weight:700; font-display:swap; src:url('/fonts/inter-latin-700-normal.woff2') format('woff2'); }
+  @font-face { font-family:'Space Grotesk'; font-style:normal; font-weight:500; font-display:swap; src:url('/fonts/space-grotesk-latin-500-normal.woff2') format('woff2'); }
+  @font-face { font-family:'Space Grotesk'; font-style:normal; font-weight:700; font-display:swap; src:url('/fonts/space-grotesk-latin-700-normal.woff2') format('woff2'); }
+  @font-face { font-family:'JetBrains Mono'; font-style:normal; font-weight:400; font-display:swap; src:url('/fonts/jetbrains-mono-latin-400-normal.woff2') format('woff2'); }
+
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    font-family: var(--font-sans);
+    background: hsl(var(--background));
+    color: hsl(var(--foreground));
+    font-size: var(--text-base);
+    line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+  }
+  #root { min-height: 100%; display: flex; flex-direction: column; }
+
+  .page {
+    width: 100%;
+    max-width: 720px;
+    margin: 0 auto;
+    padding: var(--space-lg) var(--space-lg) var(--space-2xl);
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-lg);
+    flex: 1;
+  }
+
+  /* Masthead ---------------------------------------------------------------- */
+  .masthead { display: flex; align-items: center; justify-content: space-between; }
+  .wordmark {
+    font-family: var(--font-display);
+    font-weight: 700;
+    font-size: var(--text-lg);
+    letter-spacing: -0.01em;
+  }
+  .link-status { display: flex; align-items: center; gap: var(--space-sm); font-size: var(--text-xs); color: hsl(var(--muted-foreground)); }
+  .link-dot { width: 8px; height: 8px; border-radius: var(--radius-full); background: var(--color-muted); }
+  .link-dot.online { background: var(--color-success); }
+
+  /* Status rail (the primary element) --------------------------------------- */
+  .rail {
+    --state: var(--color-muted);
+    position: relative;
+    border-radius: var(--radius-xl);
+    background:
+      linear-gradient(color-mix(in srgb, var(--state) 6%, transparent), color-mix(in srgb, var(--state) 6%, transparent)),
+      hsl(var(--card));
+    box-shadow: inset 0 0 0 1px hsl(var(--border));
+    padding: var(--space-xl);
+    transition: background 400ms ease;
+  }
+  .rail-top { display: flex; align-items: flex-start; gap: var(--space-lg); }
+  .indicator {
+    flex: 0 0 auto;
+    width: 16px; height: 16px; margin-top: 0.55rem;
+    border-radius: var(--radius-full);
+    background: var(--state);
+    box-shadow: 0 0 0 0 color-mix(in srgb, var(--state) 55%, transparent);
+  }
+  .indicator.active { animation: pulse 1.5s ease-in-out infinite; }
+  .indicator.urgent { animation: throb 0.9s ease-in-out infinite; }
+  @keyframes pulse {
+    0%, 100% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--state) 45%, transparent); opacity: 1; }
+    50%      { box-shadow: 0 0 0 10px color-mix(in srgb, var(--state) 0%, transparent); opacity: 0.75; }
+  }
+  @keyframes throb {
+    0%, 100% { transform: scale(1); box-shadow: 0 0 0 0 color-mix(in srgb, var(--state) 55%, transparent); }
+    50%      { transform: scale(1.15); box-shadow: 0 0 0 12px color-mix(in srgb, var(--state) 0%, transparent); }
+  }
+  .rail-body { flex: 1; min-width: 0; }
+  .activity {
+    font-family: var(--font-display);
+    font-weight: 500;
+    font-size: var(--text-3xl);
+    line-height: 1.15;
+    letter-spacing: -0.02em;
+    color: hsl(var(--foreground));
+    word-break: break-word;
+  }
+  .subline { margin-top: var(--space-sm); font-size: var(--text-sm); color: hsl(var(--muted-foreground)); }
+  .rail-aside { flex: 0 0 auto; display: flex; flex-direction: column; align-items: flex-end; gap: var(--space-sm); }
+  .elapsed { font-family: var(--font-mono); font-size: var(--text-sm); color: hsl(var(--muted-foreground)); font-variant-numeric: tabular-nums; }
+
+  .pill {
+    display: inline-flex; align-items: center; gap: 6px;
+    padding: 2px 10px; border-radius: var(--radius-full);
+    font-size: var(--text-xs); font-weight: 500;
+    background: color-mix(in srgb, var(--state) 15%, transparent);
+    color: var(--state);
+    text-transform: capitalize;
+  }
+
+  /* Buttons ----------------------------------------------------------------- */
+  .btn {
+    font-family: var(--font-sans); font-weight: 500; font-size: var(--text-sm);
+    border-radius: var(--radius-lg); border: 1px solid transparent;
+    padding: 0.5rem 0.9rem; cursor: pointer;
+    transition: background 150ms ease, box-shadow 150ms ease, opacity 150ms ease;
+  }
+  .btn:focus-visible { outline: none; box-shadow: var(--focus-ring); }
+  .btn-primary { background: var(--primary); color: #fff; }
+  .btn-primary:disabled { opacity: 0.5; cursor: default; }
+  .btn-ghost-danger { background: color-mix(in srgb, var(--color-error) 12%, transparent); color: var(--color-error); }
+  .btn-ghost-danger:hover { background: color-mix(in srgb, var(--color-error) 18%, transparent); }
+
+  /* Outcome cards ----------------------------------------------------------- */
+  .card {
+    border-radius: var(--radius-lg);
+    background: hsl(var(--card));
+    box-shadow: inset 0 0 0 1px hsl(var(--border));
+    padding: var(--space-lg);
+  }
+  .card h2 { font-family: var(--font-display); font-weight: 500; font-size: var(--text-base); margin: 0 0 var(--space-md); }
+  .files { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: var(--space-sm); }
+  .file { display: flex; align-items: center; gap: var(--space-sm); font-size: var(--text-sm); }
+  .file .name { font-weight: 500; }
+  .file .tag {
+    font-size: var(--text-xs); padding: 1px 8px; border-radius: var(--radius-full);
+    background: color-mix(in srgb, var(--tag) 15%, transparent); color: var(--tag);
+  }
+  .reason { font-size: var(--text-base); color: hsl(var(--foreground)); }
+  details.raw { margin-top: var(--space-md); }
+  details.raw summary { cursor: pointer; font-size: var(--text-sm); color: hsl(var(--muted-foreground)); user-select: none; }
+  details.raw pre {
+    margin: var(--space-sm) 0 0; padding: var(--space-md);
+    background: hsl(var(--muted)); border-radius: var(--radius-md);
+    font-family: var(--font-mono); font-size: var(--text-xs);
+    white-space: pre-wrap; word-break: break-word; color: hsl(var(--muted-foreground));
+    max-height: 240px; overflow: auto;
+  }
+
+  /* Composer ---------------------------------------------------------------- */
+  .composer { display: flex; flex-direction: column; gap: var(--space-sm); }
+  .composer textarea {
+    font-family: var(--font-sans); font-size: var(--text-base); color: hsl(var(--foreground));
+    background: hsl(var(--card)); border: 1px solid hsl(var(--border));
+    border-radius: var(--radius-lg); padding: var(--space-md); resize: vertical; min-height: 72px;
+  }
+  .composer textarea:focus-visible { outline: none; box-shadow: var(--focus-ring); border-color: var(--primary); }
+  .composer-row { display: flex; align-items: center; justify-content: space-between; gap: var(--space-md); }
+  .hint { font-size: var(--text-xs); color: hsl(var(--muted-foreground)); }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="module">
+import React, { useState, useEffect, useRef, useCallback } from 'https://esm.sh/react@18.3.1';
+import { createRoot } from 'https://esm.sh/react-dom@18.3.1/client';
+import htm from 'https://esm.sh/htm@3.1.1';
+
+const html = htm.bind(React.createElement);
+
+// State → colour + motion, per spec §6.1. Colours are design-system tokens.
+const STATE_META = {
+  idle:              { color: 'var(--color-muted)',   active: false },
+  thinking:          { color: 'var(--primary)',       active: true  },
+  reading:           { color: 'var(--primary)',       active: true  },
+  writing:           { color: 'var(--color-warning)', active: true  },
+  running:           { color: 'var(--color-warning)', active: true  },
+  awaiting_approval: { color: 'var(--color-error)',   active: true, urgent: true },
+  blocked:           { color: 'var(--color-error)',   active: false },
+  done:              { color: 'var(--color-success)', active: false },
+};
+const ACTIVE = new Set(['thinking', 'reading', 'writing', 'running', 'awaiting_approval']);
+
+const IDLE_STATE = { state: 'idle', activity: 'Ready', filesTouched: [] };
+
+function formatDuration(ms) {
+  if (ms == null) return '';
+  const s = Math.max(0, Math.round(ms / 1000));
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  return `${m}m ${s % 60}s`;
+}
+
+function useSocket(onMessage) {
+  const wsRef = useRef(null);
+  const [link, setLink] = useState('connecting');
+
+  useEffect(() => {
+    let closed = false;
+    let retry;
+    const connect = () => {
+      const ws = new WebSocket(`ws://${location.host}/session`);
+      wsRef.current = ws;
+      ws.onopen = () => setLink('open');
+      ws.onmessage = (e) => { try { onMessage(JSON.parse(e.data)); } catch {} };
+      ws.onclose = () => {
+        setLink('closed');
+        if (!closed) retry = setTimeout(connect, 1500);
+      };
+      ws.onerror = () => ws.close();
+    };
+    connect();
+    return () => { closed = true; clearTimeout(retry); wsRef.current?.close(); };
+  }, [onMessage]);
+
+  const send = useCallback((obj) => {
+    const ws = wsRef.current;
+    if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
+  }, []);
+
+  return { link, send };
+}
+
+function StatusRail({ status, elapsedMs, onInterrupt }) {
+  const meta = STATE_META[status.state] || STATE_META.idle;
+  const isActive = ACTIVE.has(status.state);
+  const indicatorClass = 'indicator' + (meta.urgent ? ' active urgent' : meta.active ? ' active' : '');
+
+  // Elapsed: live while active, authoritative turn duration once finished.
+  let elapsedLabel = '';
+  if (status.state === 'done' && status.turn) elapsedLabel = formatDuration(status.turn.durationMs);
+  else if (isActive && status.startedAt) elapsedLabel = formatDuration(elapsedMs);
+
+  const subline = status.friendlyName
+    ? html`<div class="subline" title=${status.truePath || ''}>${status.friendlyName}</div>`
+    : null;
+
+  return html`
+    <div class="rail" style=${{ '--state': meta.color }}>
+      <div class="rail-top">
+        <div class=${indicatorClass}></div>
+        <div class="rail-body">
+          <div class="activity">${status.activity || ' '}</div>
+          ${subline}
+        </div>
+        <div class="rail-aside">
+          <span class="pill" style=${{ '--state': meta.color }}>${status.state.replace(/_/g, ' ')}</span>
+          ${elapsedLabel && html`<span class="elapsed">${elapsedLabel}</span>`}
+          ${isActive && html`<button class="btn btn-ghost-danger" onClick=${onInterrupt}>Stop</button>`}
+        </div>
+      </div>
+    </div>`;
+}
+
+function Outcome({ status }) {
+  if (status.state === 'done') {
+    const files = status.filesTouched || [];
+    return html`
+      <div class="card">
+        <h2>Finished${status.turn ? ` · ${formatDuration(status.turn.durationMs)}` : ''}</h2>
+        ${files.length
+          ? html`<ul class="files">
+              ${files.map((f, i) => html`
+                <li class="file" key=${i} title=${f.truePath || ''}>
+                  <span class="name">${f.friendlyName}</span>
+                  <span class="tag" style=${{ '--tag': f.action === 'edited' ? 'var(--color-warning)' : 'var(--primary)' }}>
+                    ${f.action === 'edited' ? 'Edited' : 'Read'}
+                  </span>
+                </li>`)}
+            </ul>`
+          : html`<div class="hint">No files were changed.</div>`}
+      </div>`;
+  }
+
+  if (status.state === 'blocked') {
+    return html`
+      <div class="card">
+        <h2 style=${{ color: 'var(--color-error)' }}>Stopped</h2>
+        <div class="reason">${status.reason || 'It stopped before finishing.'}</div>
+        ${status.detail && html`
+          <details class="raw">
+            <summary>Show details</summary>
+            <pre>${status.detail}</pre>
+          </details>`}
+      </div>`;
+  }
+
+  return null;
+}
+
+function Composer({ disabled, onSubmit }) {
+  const [text, setText] = useState('');
+  const submit = () => {
+    const p = text.trim();
+    if (!p || disabled) return;
+    onSubmit(p);
+    setText('');
+  };
+  const onKeyDown = (e) => {
+    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); submit(); }
+  };
+  return html`
+    <div class="composer">
+      <textarea
+        placeholder="Tell the assistant what you'd like it to do…"
+        value=${text}
+        disabled=${disabled}
+        onInput=${(e) => setText(e.target.value)}
+        onKeyDown=${onKeyDown}></textarea>
+      <div class="composer-row">
+        <span class="hint">${disabled ? 'Working on your last request…' : 'Press Enter to send · Shift+Enter for a new line'}</span>
+        <button class="btn btn-primary" disabled=${disabled || !text.trim()} onClick=${submit}>Send</button>
+      </div>
+    </div>`;
+}
+
+function App() {
+  const [status, setStatus] = useState(IDLE_STATE);
+  const [now, setNow] = useState(() => Date.now());
+
+  const onMessage = useCallback((msg) => {
+    if (msg.type === 'state' && msg.state && typeof msg.state === 'object') {
+      setStatus(msg.state);
+    }
+    // 'session' messages are carried for later units; the rail doesn't need them.
+  }, []);
+
+  const { link, send } = useSocket(onMessage);
+
+  // Tick once a second while a turn is active, to drive the live elapsed timer.
+  const isActive = ACTIVE.has(status.state);
+  useEffect(() => {
+    if (!isActive) return;
+    const id = setInterval(() => setNow(Date.now()), 1000);
+    setNow(Date.now());
+    return () => clearInterval(id);
+  }, [isActive]);
+
+  const elapsedMs = status.startedAt ? now - status.startedAt : 0;
+  const busy = isActive; // composer is disabled only while a turn is running
+
+  return html`
+    <div class="page">
+      <div class="masthead">
+        <div class="wordmark">Concourse</div>
+        <div class="link-status">
+          <span class=${'link-dot' + (link === 'open' ? ' online' : '')}></span>
+          ${link === 'open' ? 'Connected' : 'Reconnecting…'}
+        </div>
+      </div>
+
+      <${StatusRail} status=${status} elapsedMs=${elapsedMs} onInterrupt=${() => send({ type: 'interrupt' })} />
+
+      <${Outcome} status=${status} />
+
+      <${Composer} disabled=${busy} onSubmit=${(prompt) => send({ type: 'submit', prompt })} />
+    </div>`;
+}
+
+createRoot(document.getElementById('root')).render(html`<${App} />`);
+</script>
+</body>
+</html>
