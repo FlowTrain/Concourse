@@ -6,7 +6,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { normaliseEvent, enrichEvent, N } from '../host.mjs';
+import { normaliseEvent, enrichEvent, redactWorkspacePaths, N } from '../host.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const FIXTURE = path.join(__dirname, '..', 'fixtures', 'session-readwrite.ndjson');
@@ -195,6 +195,31 @@ test('enrichEvent adds a friendly name to a tool step and caps a large result', 
   assert.equal(typeof enrichedEnd.content, 'string');
   assert.ok(enrichedEnd.content.length < 5000, 'capped');
   assert.match(enrichedEnd.content, /more characters\)$/);
+});
+
+test('enrichEvent strips the absolute workspace root from tool detail (no path leak to the UI)', () => {
+  // Windows-style root, backslash path in the result — the common real case.
+  const win = 'C:\\Users\\me\\ws';
+  const winEnd = enrichEvent(
+    { kind: N.TOOL_END, toolUseId: 't', isError: false, content: `File created successfully at: ${win}\\outputs\\deck.pptx` },
+    win,
+  );
+  assert.ok(!winEnd.content.includes(win), 'workspace root removed');
+  assert.match(winEnd.content, /outputs\\deck\.pptx$/);
+
+  // POSIX-style root, forward-slash path.
+  const nix = '/home/me/ws';
+  const nixEnd = enrichEvent(
+    { kind: N.TOOL_END, toolUseId: 't', isError: false, content: `wrote ${nix}/summary.txt` },
+    nix,
+  );
+  assert.equal(nixEnd.content, 'wrote summary.txt');
+});
+
+test('redactWorkspacePaths turns a bare root into a plain-language token and tolerates non-strings', () => {
+  assert.equal(redactWorkspacePaths('saved under C:\\a\\ws', 'C:\\a\\ws'), 'saved under the workspace');
+  assert.equal(redactWorkspacePaths(null, '/x'), null);
+  assert.equal(redactWorkspacePaths('unchanged', null), 'unchanged');
 });
 
 test('unknown / malformed events are tolerated and emit nothing', () => {

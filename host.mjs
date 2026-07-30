@@ -209,8 +209,10 @@ export function projectState(s) {
     truePath: s.truePath,
     filesTouched: s.filesTouched,
     reason: s.reason,
-    detail: s.detail,
-    note: s.note,
+    // Raw failure text can carry absolute paths (a result message, a host error);
+    // redact the workspace root so it stays workspace-relative in the UI.
+    detail: redactWorkspacePaths(s.detail, s.workspaceRoot),
+    note: redactWorkspacePaths(s.note, s.workspaceRoot),
     turn: s.turn,
     startedAt: s.startedAt,
     sessionId: s.sessionId,
@@ -237,6 +239,25 @@ function capText(s, max) {
 }
 
 /**
+ * Strip the absolute workspace root out of any raw text bound for the browser,
+ * so tool output and error detail stay workspace-relative. Absolute paths never
+ * reach the UI (CLAUDE.md design constraint) — the true path lives only in a
+ * tooltip the reducer carries separately. Handles both slash conventions.
+ * @param {string} text
+ * @param {string|null} workspaceRoot
+ */
+export function redactWorkspacePaths(text, workspaceRoot) {
+  if (typeof text !== 'string' || !workspaceRoot) return text;
+  const roots = [workspaceRoot, workspaceRoot.replace(/\\/g, '/'), workspaceRoot.replace(/\//g, '\\')];
+  let out = text;
+  for (const r of roots) {
+    if (!r) continue;
+    out = out.split(`${r}\\`).join('').split(`${r}/`).join('').split(r).join('the workspace');
+  }
+  return out;
+}
+
+/**
  * Enrich a normalised event for the transcript stream. TOOL_START gets the same
  * friendly name (§6.3) the rail uses so the two agree; TOOL_END's raw result is
  * flattened to text and capped. Everything else passes through untouched.
@@ -253,7 +274,8 @@ export function enrichEvent(evt, workspaceRoot) {
     return evt;
   }
   if (evt.kind === N.TOOL_END) {
-    return { ...evt, content: capText(toText(evt.content), 4000) };
+    const text = redactWorkspacePaths(toText(evt.content), workspaceRoot);
+    return { ...evt, content: capText(text, 4000) };
   }
   return evt;
 }
