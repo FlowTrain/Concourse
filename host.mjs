@@ -1,0 +1,855 @@
+// host.mjs — Concourse local host (Node 20+, ESM).
+//
+// This is the irreducible piece: the browser cannot spawn a process, so a thin
+// Node host wraps one Claude Code agent loop, normalises its event stream into
+// turn-level state, and serves a single-file front end over loopback.
+//
+// Build order (see CLAUDE.md): this file grows one unit at a time.
+//   Unit 1 (this)   — express + ws skeleton, health check. Prove the socket.
+//   Unit 2 (next)   — CliEngine: spawn `claude -p`, consume NDJSON, emit RawEvent.
+//   Unit 3          — EventNormaliser (§5).
+//   Unit 4          — StateReducer (§6).
+//
+// The pure pieces (normaliser, reducer, engine) are exported so `node --test`
+// can drive them without starting the server. Server bootstrap is guarded
+// behind a main-module check at the bottom of the file.
+
+import express from 'express';
+import http from 'node:http';
+import fs from 'node:fs';
+import path from 'node:path';
+import os from 'node:os';
+import readline from 'node:readline';
+import { spawn } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
+import { WebSocketServer } from 'ws';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+// Loopback bind IS the auth model for v0.1 (spec §14). Do not bind 0.0.0.0.
+export const HOST = '127.0.0.1';
+export const PORT = 7317;
+
+// ---------------------------------------------------------------------------
+// Config
+// ---------------------------------------------------------------------------
+
+/**
+ * Resolve the workspace root the agent runs against.
+ * Precedence: CONCOURSE_WORKSPACE env → first CLI arg → <repo>/workspace.
+ * A leading `~` is expanded to the user's home directory.
+ * @param {{ env?: NodeJS.ProcessEnv, argv?: string[] }} [opts]
+ * @returns {string} absolute path
+ */
+export function resolveWorkspaceRoot({ env = process.env, argv = process.argv } = {}) {
+  const raw = env.CONCOURSE_WORKSPACE || argv[2] || path.join(__dirname, 'workspace');
+  const expanded = raw.startsWith('~')
+    ? path.join(os.homedir(), raw.slice(1))
+    : raw;
+  return path.resolve(expanded);
+}
+
+/**
+ * Ensure the workspace directory exists. Created lazily so a fresh checkout
+ * boots without a manual mkdir.
+ * @param {string} workspaceRoot
+ */
+export function ensureWorkspace(workspaceRoot) {
+  fs.mkdirSync(workspaceRoot, { recursive: true });
+  return workspaceRoot;
+}
+
+// ---------------------------------------------------------------------------
+// Host state (in-memory, single session for v0.1)
+// ---------------------------------------------------------------------------
+
+/**
+ * @typedef {Object} HostState
+ * @property {string} workspaceRoot
+ * @property {string|null} sessionId  captured from SESSION_OPEN once a turn runs
+ * @property {import('./host.mjs').CliEngine|null} activeEngine  the in-flight turn's engine, if any
+ */
+
+/** @returns {HostState} */
+export function createHostState(workspaceRoot) {
+  return { workspaceRoot, sessionId: null, activeEngine: null };
+}
+
+// ---------------------------------------------------------------------------
+// HTTP app
+// ---------------------------------------------------------------------------
+
+/**
+ * Build the express app. Kept as a factory so tests can mount it without a
+ * listening socket.
+ * @param {HostState} hostState
+ */
+export function createApp(hostState) {
+  const app = express();
+  const appHtmlPath = path.join(__dirname, 'app.html');
+
+  // GET / — the single-file front end. Not built until unit 5; until then a
+  // plain placeholder so a browser hit doesn't 404 during backend work.
+  app.get('/', (_req, res) => {
+    if (fs.existsSync(appHtmlPath)) {
+      res.sendFile(appHtmlPath);
+    } else {
+      res
+        .status(200)
+        .type('text/plain')
+        .send('Concourse host is running. The interface has not been built yet.');
+    }
+  });
+
+  // GET /health — liveness + current session snapshot. Used to prove the host
+  // is up and to confirm session capture in later units.
+  app.get('/health', (_req, res) => {
+    res.json({
+      ok: true,
+      workspaceRoot: hostState.workspaceRoot,
+      sessionId: hostState.sessionId,
+    });
+  });
+
+  return app;
+}
+
+// ---------------------------------------------------------------------------
+// WebSocket wiring
+// ---------------------------------------------------------------------------
+
+/**
+ * Attach a WebSocketServer to an existing HTTP server, upgrading only on the
+ * `/session` path. On connect the client receives the current state so the UI
+ * can render something legible before the first turn.
+ *
+ * Unit 1 handles connect + a state hello only. Inbound {submit,approve,interrupt}
+ * messages arrive in unit 2 when the engine is wired in.
+ *
+ * @param {http.Server} server
+ * @param {HostState} hostState
+ * @returns {WebSocketServer}
+ */
+export function attachSessionSocket(server, hostState) {
+  const wss = new WebSocketServer({ noServer: true });
+
+  server.on('upgrade', (req, socket, head) => {
+    const { pathname } = new URL(req.url, `http://${HOST}:${PORT}`);
+    if (pathname !== '/session') {
+      socket.destroy();
+      return;
+    }
+    wss.handleUpgrade(req, socket, head, (ws) => {
+      wss.emit('connection', ws, req);
+    });
+  });
+
+  wss.on('connection', (ws) => {
+    // Hello: the reducer's initial state. Everything downstream is a transition
+    // from here.
+    send(ws, { type: 'state', state: 'idle' });
+    send(ws, { type: 'session', sessionId: hostState.sessionId });
+
+    ws.on('message', (data) => {
+      let msg;
+      try {
+        msg = JSON.parse(data.toString());
+      } catch {
+        return; // ignore non-JSON frames
+      }
+      handleClientMessage(ws, hostState, msg);
+    });
+  });
+
+  return wss;
+}
+
+/**
+ * Send a JSON message over a socket if it is open. Centralised so every host→
+ * browser message is serialised the same way.
+ * @param {import('ws').WebSocket} ws
+ * @param {object} message
+ */
+export function send(ws, message) {
+  if (ws.readyState === ws.OPEN) {
+    ws.send(JSON.stringify(message));
+  }
+}
+
+/**
+ * Route an inbound browser→host message (§11). Three verbs in v0.1: submit,
+ * interrupt, approve.
+ * @param {import('ws').WebSocket} ws
+ * @param {HostState} hostState
+ * @param {{ type?: string, prompt?: string, requestId?: string, decision?: string }} msg
+ */
+export function handleClientMessage(ws, hostState, msg) {
+  if (!msg || typeof msg.type !== 'string') return;
+  switch (msg.type) {
+    case 'submit':
+      if (typeof msg.prompt !== 'string' || msg.prompt.trim() === '') return;
+      if (hostState.activeEngine) {
+        // One turn at a time in v0.1. Silently drop overlapping submits.
+        return;
+      }
+      // Fire and forget; runTurn streams over the socket and console.
+      runTurn(ws, hostState, msg.prompt);
+      break;
+    case 'interrupt':
+      if (hostState.activeEngine) hostState.activeEngine.interrupt();
+      break;
+    case 'approve':
+      // CliEngine: no-op (allowlist decided in advance). Real path is v0.2.
+      if (hostState.activeEngine) {
+        hostState.activeEngine.respondToPermission(msg.requestId, msg.decision);
+      }
+      break;
+    default:
+      // Unknown verb — ignore rather than crash the socket.
+      break;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Agent engine (§4)
+// ---------------------------------------------------------------------------
+
+/**
+ * The loose coupler. Two engines will implement this: CliEngine (v0.1, spawns
+ * the CLI) and SdkEngine (v0.2, the Agent SDK with a real permission callback).
+ * Building to the interface keeps that swap a one-line change (§4, soul.md).
+ *
+ * @typedef {Object} IAgentEngine
+ * @property {(opts: { prompt: string, sessionId?: string|null, cwd: string }) => AsyncIterable<RawEvent>} start
+ * @property {(requestId: string, decision: 'allow'|'deny') => void} respondToPermission
+ * @property {() => Promise<void>} interrupt
+ * @property {{ permissionCallbacks: boolean, nativeMultiTurn: boolean }} capabilities
+ */
+
+/**
+ * A raw event off the engine. For CliEngine these are the parsed stream-json
+ * objects from the CLI (they carry their own `type`), plus a few host-internal
+ * synthetic events (double-underscore prefix) for out-of-band conditions the
+ * stream itself cannot express — stderr, non-zero exit, spawn failure, an
+ * unparseable line. The normaliser (unit 3) maps all of these to §5 events.
+ * @typedef {object} RawEvent
+ */
+
+/**
+ * CliEngine — day-one proof (§4.1). Spawns `claude -p` per turn and streams its
+ * newline-delimited JSON. One process per turn; multi-turn via captured
+ * session_id + `--resume`. Permission handling is flag-only here (no callback),
+ * so the allowlist is conservative and Bash is never granted (§4.1, Rule 5).
+ *
+ * @implements {IAgentEngine}
+ */
+export class CliEngine {
+  /** @param {{ bin?: string }} [opts] */
+  constructor({ bin } = {}) {
+    // `claude` is a native .exe here, so shell:false spawn resolves it on PATH
+    // with no shell-injection surface from the user's prompt. An override lets
+    // a machine with only a .cmd shim point at an explicit launcher.
+    this.bin = bin || process.env.CONCOURSE_CLAUDE_BIN || 'claude';
+    /** @type {import('node:child_process').ChildProcess|null} */
+    this.child = null;
+    this.capabilities = { permissionCallbacks: false, nativeMultiTurn: false };
+  }
+
+  /**
+   * Build the exact CLI invocation. Exposed (not inlined) so the debug path can
+   * print the equivalent command and tests can assert the flags without a spawn.
+   * @param {{ prompt: string, sessionId?: string|null }} opts
+   * @returns {string[]}
+   */
+  buildArgs({ prompt, sessionId }) {
+    const args = [
+      '-p', prompt,
+      '--output-format', 'stream-json',
+      '--verbose', // stream-json requires this
+      '--include-partial-messages', // token-level deltas require this
+      '--allowedTools', 'Read,Glob,Grep,Edit,Write', // conservative; no Bash
+      '--permission-mode', 'acceptEdits',
+    ];
+    if (sessionId) {
+      args.push('--resume', sessionId);
+    }
+    return args;
+  }
+
+  /**
+   * Spawn a turn and yield raw events until the process closes.
+   * @param {{ prompt: string, sessionId?: string|null, cwd: string }} opts
+   * @returns {AsyncGenerator<RawEvent>}
+   */
+  async *start({ prompt, sessionId = null, cwd }) {
+    const args = this.buildArgs({ prompt, sessionId });
+    const child = spawn(this.bin, args, {
+      cwd,
+      stdio: ['ignore', 'pipe', 'pipe'],
+      windowsHide: true,
+    });
+    this.child = child;
+
+    /** @type {RawEvent[]} */
+    const queue = [];
+    let finished = false;
+    /** @type {(() => void)|null} */
+    let wake = null;
+    const push = (event) => {
+      queue.push(event);
+      if (wake) { const w = wake; wake = null; w(); }
+    };
+    const finish = () => {
+      finished = true;
+      if (wake) { const w = wake; wake = null; w(); }
+    };
+
+    const rl = readline.createInterface({ input: child.stdout, crlfDelay: Infinity });
+    rl.on('line', (line) => {
+      const trimmed = line.trim();
+      if (!trimmed) return;
+      try {
+        push(JSON.parse(trimmed));
+      } catch {
+        // A line that isn't JSON is a host-level anomaly, not agent output.
+        push({ type: '__parse_error', line: trimmed });
+      }
+    });
+
+    let stderr = '';
+    child.stderr.on('data', (chunk) => { stderr += chunk.toString(); });
+
+    child.on('error', (err) => {
+      // e.g. the executable isn't found. Surface, don't swallow.
+      push({ type: '__spawn_error', message: err.message });
+      finish();
+    });
+    child.on('close', (code, signal) => {
+      // stdout has ended by now, so all JSON lines are already queued.
+      if (stderr.trim()) push({ type: '__stderr', text: stderr.trim() });
+      if (code !== 0) push({ type: '__exit', code, signal });
+      finish();
+    });
+
+    try {
+      while (true) {
+        while (queue.length) yield queue.shift();
+        if (finished) break;
+        await new Promise((resolve) => { wake = resolve; });
+      }
+    } finally {
+      this.child = null;
+    }
+  }
+
+  /**
+   * No-op for CliEngine: permissions are decided by the static allowlist, not a
+   * runtime callback (§4.1). The approval modal path lives in SdkEngine (v0.2).
+   */
+  respondToPermission(_requestId, _decision) {
+    // intentionally empty
+  }
+
+  /** Terminate the in-flight turn. */
+  async interrupt() {
+    if (this.child && !this.child.killed) {
+      this.child.kill('SIGTERM');
+    }
+  }
+}
+
+/**
+ * Run one turn for a connected client. Unit 2 logs raw events to the console
+ * only (per build order) and captures session_id; normalisation into UI events
+ * is unit 3.
+ * @param {import('ws').WebSocket} ws
+ * @param {HostState} hostState
+ * @param {string} prompt
+ */
+export async function runTurn(ws, hostState, prompt) {
+  const engine = new CliEngine();
+  hostState.activeEngine = engine;
+  try {
+    for await (const raw of engine.start({
+      prompt,
+      sessionId: hostState.sessionId,
+      cwd: hostState.workspaceRoot,
+    })) {
+      // Unit 2: console only. This becomes normalise → reduce → ws in units 3–4.
+      console.log('[raw]', JSON.stringify(raw));
+      if (raw && typeof raw === 'object' && typeof raw.session_id === 'string') {
+        if (raw.session_id !== hostState.sessionId) {
+          hostState.sessionId = raw.session_id;
+          send(ws, { type: 'session', sessionId: hostState.sessionId });
+        }
+      }
+    }
+  } catch (err) {
+    console.error('[turn error]', err && err.message ? err.message : err);
+  } finally {
+    hostState.activeEngine = null;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Event normalisation (§5)
+// ---------------------------------------------------------------------------
+//
+// Raw engine events → engine-agnostic normalised events, so the reducer never
+// sees CLI-shaped data. Two hard rules from the spec:
+//   1. Dispatch on event `type`; iterate `content` blocks by their `type`,
+//      never by array position (the shape of content varies per turn).
+//   2. Any `result` subtype other than success is a surfaced failure, never
+//      swallowed.
+// One raw event may yield zero, one, or several normalised events.
+
+/** Normalised event kinds (the reducer's vocabulary). */
+export const N = {
+  SESSION_OPEN: 'SESSION_OPEN',
+  NARRATION: 'NARRATION',
+  TOOL_START: 'TOOL_START',
+  TOOL_END: 'TOOL_END',
+  APPROVAL_NEEDED: 'APPROVAL_NEEDED',
+  TURN_END: 'TURN_END',
+  HOST_ERROR: 'HOST_ERROR',
+};
+
+/**
+ * @param {RawEvent} raw
+ * @returns {object[]} zero or more normalised events
+ */
+export function normaliseEvent(raw) {
+  if (!raw || typeof raw !== 'object' || typeof raw.type !== 'string') return [];
+
+  switch (raw.type) {
+    case 'system':
+      if (raw.subtype === 'init') {
+        return [{
+          kind: N.SESSION_OPEN,
+          sessionId: raw.session_id ?? null,
+          model: raw.model ?? null,
+          cwd: raw.cwd ?? null,
+          tools: Array.isArray(raw.tools) ? raw.tools : [],
+        }];
+      }
+      // Tolerate every other system subtype: hook_started, hook_response,
+      // status, post_turn_summary, api_retry, and any future one.
+      return [];
+
+    case 'assistant':
+      return normaliseAssistant(raw);
+
+    case 'user':
+      return normaliseUser(raw);
+
+    case 'stream_event':
+      return normaliseStreamEvent(raw);
+
+    case 'result':
+      return [normaliseResult(raw)];
+
+    // Host-internal synthetic events from CliEngine (out-of-band conditions the
+    // stream itself can't express). stderr and an unreadable line are surfaced
+    // but non-fatal — a successful turn can still print a warning to stderr.
+    case '__stderr':
+      return [{ kind: N.HOST_ERROR, reason: 'stderr', detail: raw.text ?? '', fatal: false }];
+    case '__parse_error':
+      return [{ kind: N.HOST_ERROR, reason: 'unreadable-output', detail: raw.line ?? '', fatal: false }];
+    case '__exit':
+      return [{
+        kind: N.HOST_ERROR,
+        reason: 'process-exit',
+        detail: `exit code ${raw.code}${raw.signal ? ` (${raw.signal})` : ''}`,
+        fatal: true,
+      }];
+    case '__spawn_error':
+      return [{ kind: N.HOST_ERROR, reason: 'spawn-failed', detail: raw.message ?? '', fatal: true }];
+
+    // TODO(v0.2, SdkEngine): APPROVAL_NEEDED. The CLI stream has no permission-
+    // request event — CliEngine is flag-only (§4.1), so this path is unreachable
+    // under it. SdkEngine's permission callback will be adapted into a host-
+    // internal `__approval` event whose shape this host defines, which is why we
+    // recognise that here rather than guess a CLI API.
+    case '__approval':
+      return [{
+        kind: N.APPROVAL_NEEDED,
+        requestId: raw.requestId ?? null,
+        tool: raw.tool ?? null,
+        input: raw.input ?? null,
+      }];
+
+    default:
+      // Unknown top-level type (e.g. rate_limit_event) — tolerate, emit nothing.
+      return [];
+  }
+}
+
+/** @param {RawEvent} raw */
+function normaliseAssistant(raw) {
+  const blocks = raw.message?.content;
+  if (!Array.isArray(blocks)) return [];
+  const parentToolUseId = raw.parent_tool_use_id ?? null;
+  const out = [];
+  for (const b of blocks) {
+    if (!b || typeof b.type !== 'string') continue;
+    if (b.type === 'text') {
+      if (typeof b.text === 'string' && b.text.length > 0) {
+        out.push({ kind: N.NARRATION, text: b.text, partial: false, parentToolUseId });
+      }
+    } else if (b.type === 'tool_use') {
+      out.push({
+        kind: N.TOOL_START,
+        toolUseId: b.id ?? null,
+        tool: b.name ?? null,
+        input: b.input ?? {},
+        parentToolUseId,
+      });
+    }
+    // thinking / other block types: ignored.
+  }
+  return out;
+}
+
+/** @param {RawEvent} raw */
+function normaliseUser(raw) {
+  const blocks = raw.message?.content;
+  if (!Array.isArray(blocks)) return [];
+  const parentToolUseId = raw.parent_tool_use_id ?? null;
+  const out = [];
+  for (const b of blocks) {
+    if (b && b.type === 'tool_result') {
+      out.push({
+        kind: N.TOOL_END,
+        toolUseId: b.tool_use_id ?? null,
+        isError: b.is_error === true,
+        content: b.content ?? null,
+        parentToolUseId,
+      });
+    }
+  }
+  return out;
+}
+
+/** @param {RawEvent} raw */
+function normaliseStreamEvent(raw) {
+  const ev = raw.event;
+  if (ev && ev.delta && ev.delta.type === 'text_delta' && typeof ev.delta.text === 'string') {
+    return [{
+      kind: N.NARRATION,
+      text: ev.delta.text,
+      partial: true,
+      parentToolUseId: raw.parent_tool_use_id ?? null,
+    }];
+  }
+  // message_start / content_block_start / message_stop / etc.: no UI event.
+  return [];
+}
+
+/** @param {RawEvent} raw */
+function normaliseResult(raw) {
+  const ok = raw.subtype === 'success' && raw.is_error !== true;
+  return {
+    kind: N.TURN_END,
+    sessionId: raw.session_id ?? null,
+    subtype: raw.subtype ?? null,
+    ok,
+    isError: raw.is_error === true,
+    durationMs: raw.duration_ms ?? null,
+    numTurns: raw.num_turns ?? null,
+    costUsd: raw.total_cost_usd ?? null,
+    resultText: typeof raw.result === 'string' ? raw.result : null,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// State machine (§6) — the load-bearing component
+// ---------------------------------------------------------------------------
+//
+// A pure reducer: reduceState(state, event) -> next state. It answers the only
+// question the job story cares about — "what is it doing right now and does it
+// need me?" — as a coarse state plus plain-language, jargon-free surface text.
+// No Date.now() here: elapsed time is the UI's job. `startedAt` is stamped by
+// the host and passed in on SUBMIT so the reducer stays deterministic.
+
+const READING_TOOLS = new Set(['Read', 'Glob', 'Grep', 'NotebookRead']);
+const WRITING_TOOLS = new Set(['Edit', 'Write', 'MultiEdit', 'NotebookEdit']);
+
+/** §6.2 tool → coarse state. Anything unmapped (incl. MCP tools) is 'thinking'. */
+export function toolToState(tool) {
+  if (READING_TOOLS.has(tool)) return 'reading';
+  if (WRITING_TOOLS.has(tool)) return 'writing';
+  if (tool === 'Bash') return 'running';
+  return 'thinking';
+}
+
+// Extensions dropped from friendly names (known document types, §6.3).
+const DOC_EXTS = new Set([
+  'pptx', 'ppt', 'docx', 'doc', 'xlsx', 'xls', 'pdf',
+  'md', 'txt', 'csv', 'rtf', 'odt', 'key', 'pages', 'numbers',
+]);
+
+/**
+ * §6.3 — a name this audience can read. Workspace-relative, known document
+ * extension dropped, separators to spaces, title-cased. The absolute path is
+ * kept separately for a tooltip; it never becomes the label.
+ * @param {string} absPath
+ * @param {string|null} workspaceRoot
+ * @returns {{ friendly: string, truePath: string }}
+ */
+export function friendlyName(absPath, workspaceRoot) {
+  const truePath = absPath;
+  let rel;
+  try {
+    rel = workspaceRoot ? path.relative(workspaceRoot, absPath) : absPath;
+  } catch {
+    rel = absPath;
+  }
+  // If it escapes the workspace or isn't relative, fall back to the file name.
+  if (!rel || rel.startsWith('..') || path.isAbsolute(rel)) {
+    rel = path.basename(absPath);
+  }
+  let base = path.basename(rel);
+  const dot = base.lastIndexOf('.');
+  if (dot > 0 && DOC_EXTS.has(base.slice(dot + 1).toLowerCase())) {
+    base = base.slice(0, dot);
+  }
+  const friendly = base
+    .replace(/[_-]+/g, ' ')
+    .trim()
+    .split(/\s+/)
+    .map((w) => (w ? w[0].toUpperCase() + w.slice(1) : w))
+    .join(' ');
+  return { friendly: friendly || base, truePath };
+}
+
+/** First file-ish path in a tool input, or null (Glob/Grep have none). */
+function fileOf(input) {
+  if (!input || typeof input !== 'object') return null;
+  return input.file_path || input.notebook_path || input.path || null;
+}
+
+/** Dedupe files touched by true path; an edit supersedes a read. */
+function recordFile(list, entry) {
+  const idx = list.findIndex((f) => f.truePath === entry.truePath);
+  if (idx === -1) return [...list, entry];
+  if (entry.action === 'edited' && list[idx].action !== 'edited') {
+    const copy = list.slice();
+    copy[idx] = entry;
+    return copy;
+  }
+  return list;
+}
+
+/** Plain-language reason for a failed turn. Raw text goes in `detail`. */
+function friendlyFailure(evt) {
+  switch (evt.subtype) {
+    case 'error_max_turns':
+      return 'It reached the limit on how many steps it could take.';
+    case 'error_during_execution':
+      return 'It ran into a problem while working and had to stop.';
+    default:
+      return 'It stopped before finishing.';
+  }
+}
+
+/** Plain-language reason for a host-level failure. Raw text goes in `detail`. */
+function friendlyHostError(evt) {
+  switch (evt.reason) {
+    case 'spawn-failed':
+      return "Couldn't start the assistant. It may not be installed correctly.";
+    case 'process-exit':
+      return 'The assistant stopped unexpectedly.';
+    default:
+      return 'Something went wrong.';
+  }
+}
+
+/** @param {string|null} workspaceRoot */
+export function createInitialState(workspaceRoot = null) {
+  return {
+    state: 'idle',
+    activity: 'Ready',
+    friendlyName: null,
+    truePath: null,
+    narration: '',
+    filesTouched: [],
+    reason: null,
+    detail: null,
+    note: null,
+    sessionId: null,
+    model: null,
+    approval: null,
+    turn: null,
+    resultText: null,
+    startedAt: null,
+    workspaceRoot,
+    currentToolUseId: null,
+  };
+}
+
+/**
+ * The §6 transition function. `SUBMIT` is a host-originated action (the user
+ * sent a prompt); every other kind is a normalised engine event.
+ * @param {ReturnType<typeof createInitialState>} state
+ * @param {{ kind: string, [k: string]: any }} evt
+ */
+export function reduceState(state, evt) {
+  if (!evt || typeof evt.kind !== 'string') return state;
+
+  switch (evt.kind) {
+    case 'SUBMIT':
+      // idle / done / blocked → thinking. Fresh turn: clear last turn's traces.
+      return {
+        ...state,
+        state: 'thinking',
+        activity: 'Working out how to do this',
+        friendlyName: null,
+        truePath: null,
+        narration: '',
+        filesTouched: [],
+        reason: null,
+        detail: null,
+        note: null,
+        approval: null,
+        turn: null,
+        resultText: null,
+        startedAt: evt.at ?? null,
+        currentToolUseId: null,
+      };
+
+    case N.SESSION_OPEN:
+      return {
+        ...state,
+        sessionId: evt.sessionId ?? state.sessionId,
+        model: evt.model ?? state.model,
+      };
+
+    case N.NARRATION:
+      // Prose only; the coarse state is unchanged (deltas stream while thinking).
+      return { ...state, narration: evt.partial ? state.narration + evt.text : evt.text };
+
+    case N.TOOL_START: {
+      const s = toolToState(evt.tool);
+      const next = { ...state, state: s, currentToolUseId: evt.toolUseId ?? null };
+      if (s === 'reading' || s === 'writing') {
+        const abs = fileOf(evt.input);
+        if (abs) {
+          const fn = friendlyName(abs, state.workspaceRoot);
+          next.friendlyName = fn.friendly;
+          next.truePath = fn.truePath;
+          next.activity = (s === 'reading' ? 'Reading ' : 'Editing ') + fn.friendly;
+        } else {
+          next.friendlyName = null;
+          next.truePath = null;
+          next.activity = s === 'reading' ? 'Looking through your files' : 'Saving your changes';
+        }
+      } else if (s === 'running') {
+        next.friendlyName = null;
+        next.truePath = null;
+        next.activity = 'Running a command';
+      } else {
+        next.friendlyName = null;
+        next.truePath = null;
+        next.activity = 'Working on it';
+      }
+      return next;
+    }
+
+    case N.TOOL_END: {
+      // Record the file the just-finished tool touched, then return to thinking.
+      let filesTouched = state.filesTouched;
+      if ((state.state === 'reading' || state.state === 'writing') && state.friendlyName) {
+        filesTouched = recordFile(filesTouched, {
+          friendlyName: state.friendlyName,
+          truePath: state.truePath,
+          action: state.state === 'reading' ? 'read' : 'edited',
+        });
+      }
+      return {
+        ...state,
+        state: 'thinking',
+        activity: 'Working out what to do next',
+        friendlyName: null,
+        truePath: null,
+        currentToolUseId: null,
+        filesTouched,
+      };
+    }
+
+    case N.APPROVAL_NEEDED:
+      return {
+        ...state,
+        state: 'awaiting_approval',
+        activity: 'Needs your OK',
+        approval: { requestId: evt.requestId, tool: evt.tool, input: evt.input },
+      };
+
+    case N.TURN_END:
+      if (evt.ok) {
+        return {
+          ...state,
+          state: 'done',
+          activity: 'Finished',
+          reason: null,
+          detail: null,
+          turn: { durationMs: evt.durationMs, costUsd: evt.costUsd, numTurns: evt.numTurns },
+          resultText: evt.resultText ?? null,
+        };
+      }
+      return {
+        ...state,
+        state: 'blocked',
+        activity: "Stopped — here's what went wrong",
+        reason: friendlyFailure(evt),
+        detail: evt.resultText ?? null,
+      };
+
+    case N.HOST_ERROR:
+      if (evt.fatal) {
+        return {
+          ...state,
+          state: 'blocked',
+          activity: "Stopped — here's what went wrong",
+          reason: friendlyHostError(evt),
+          detail: evt.detail ?? null,
+        };
+      }
+      // Non-fatal (e.g. a stderr warning on an otherwise-fine turn): surface as
+      // a note, never change the state — it must not override a coming 'done'.
+      return { ...state, note: evt.detail ?? null };
+
+    default:
+      return state;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Bootstrap
+// ---------------------------------------------------------------------------
+
+/**
+ * Start the host: resolve config, build the app, attach the socket, listen.
+ * @returns {{ server: http.Server, hostState: HostState, wss: WebSocketServer }}
+ */
+export function startHost() {
+  const workspaceRoot = ensureWorkspace(resolveWorkspaceRoot());
+  const hostState = createHostState(workspaceRoot);
+  const app = createApp(hostState);
+  const server = http.createServer(app);
+  const wss = attachSessionSocket(server, hostState);
+
+  server.listen(PORT, HOST, () => {
+    console.log(`Concourse host listening on http://${HOST}:${PORT}`);
+    console.log(`Workspace: ${workspaceRoot}`);
+  });
+
+  return { server, hostState, wss };
+}
+
+// Only start the server when run directly (`node host.mjs` / `npm start`),
+// never when imported by a test. This is what keeps the pure functions in
+// later units unit-testable.
+const isMain = process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+if (isMain) {
+  startHost();
+}
