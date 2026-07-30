@@ -1,3 +1,7 @@
+# Concourse workspace + sidecars (real user documents / runtime state)
+/workspace/
+.concourse/
+
 # Logs
 logs
 *.log
