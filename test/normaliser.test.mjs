@@ -6,7 +6,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { normaliseEvent, N } from '../host.mjs';
+import { normaliseEvent, enrichEvent, N } from '../host.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const FIXTURE = path.join(__dirname, '..', 'fixtures', 'session-readwrite.ndjson');
@@ -144,6 +144,57 @@ test('one assistant message with [text, tool_use] yields both, in order', () => 
   assert.equal(evts[0].kind, N.NARRATION);
   assert.equal(evts[1].kind, N.TOOL_START);
   assert.equal(evts[1].tool, 'Read');
+});
+
+test('narration carries a channel: prose is speech, extended thinking is thinking', () => {
+  // Speech from a streamed text delta
+  const [speech] = normaliseEvent({
+    type: 'stream_event',
+    event: { type: 'content_block_delta', delta: { type: 'text_delta', text: 'Reading now' } },
+  });
+  assert.equal(speech.kind, N.NARRATION);
+  assert.equal(speech.channel, 'speech');
+  assert.equal(speech.partial, true);
+
+  // Reasoning from a streamed thinking delta
+  const [thinkDelta] = normaliseEvent({
+    type: 'stream_event',
+    event: { type: 'content_block_delta', delta: { type: 'thinking_delta', thinking: 'Let me consider…' } },
+  });
+  assert.equal(thinkDelta.kind, N.NARRATION);
+  assert.equal(thinkDelta.channel, 'thinking');
+  assert.equal(thinkDelta.text, 'Let me consider…');
+  assert.equal(thinkDelta.partial, true);
+
+  // Reasoning from a full thinking block on an assistant message
+  const [thinkBlock] = normaliseEvent({
+    type: 'assistant',
+    message: { content: [{ type: 'thinking', thinking: 'Weighing the options.' }] },
+    parent_tool_use_id: null,
+  });
+  assert.equal(thinkBlock.kind, N.NARRATION);
+  assert.equal(thinkBlock.channel, 'thinking');
+  assert.equal(thinkBlock.text, 'Weighing the options.');
+  assert.equal(thinkBlock.partial, false);
+});
+
+test('enrichEvent adds a friendly name to a tool step and caps a large result', () => {
+  const ws = '/ws';
+  const [start] = normaliseEvent({
+    type: 'assistant',
+    message: { content: [{ type: 'tool_use', id: 't1', name: 'Read', input: { file_path: '/ws/q3_board_deck.pptx' } }] },
+    parent_tool_use_id: null,
+  });
+  const enriched = enrichEvent(start, ws);
+  assert.equal(enriched.friendly, 'Q3 Board Deck');
+  assert.equal(enriched.truePath, '/ws/q3_board_deck.pptx');
+
+  // TOOL_END content (array of blocks) is flattened to text and capped.
+  const end = { kind: N.TOOL_END, toolUseId: 't1', isError: false, content: [{ type: 'text', text: 'x'.repeat(5000) }] };
+  const enrichedEnd = enrichEvent(end, ws);
+  assert.equal(typeof enrichedEnd.content, 'string');
+  assert.ok(enrichedEnd.content.length < 5000, 'capped');
+  assert.match(enrichedEnd.content, /more characters\)$/);
 });
 
 test('unknown / malformed events are tolerated and emit nothing', () => {
