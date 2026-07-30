@@ -155,6 +155,24 @@ test('a new submit from done/blocked resets to thinking with cleared traces', ()
   assert.equal(fresh.startedAt, 2000);
 });
 
+test('a TOOL_END that does not match the active tool is ignored (out-of-order / replay)', () => {
+  const ws = path.resolve('/ws');
+  let s = reduceState(createInitialState(ws), submit());
+  s = reduceState(s, { kind: N.TOOL_START, tool: 'Read', toolUseId: 'active', input: { file_path: path.join(ws, 'a.txt') } });
+  assert.equal(s.state, 'reading');
+
+  // A stray end for a different tool must not reset state or record a file.
+  const stray = reduceState(s, { kind: N.TOOL_END, toolUseId: 'other', isError: false });
+  assert.equal(stray.state, 'reading');
+  assert.deepEqual(stray.filesTouched, []);
+  assert.equal(stray.friendlyName, 'A');
+
+  // The matching end advances the machine and records the file.
+  const done = reduceState(s, { kind: N.TOOL_END, toolUseId: 'active', isError: false });
+  assert.equal(done.state, 'thinking');
+  assert.deepEqual(done.filesTouched, [{ friendlyName: 'A', truePath: path.join(ws, 'a.txt'), action: 'read' }]);
+});
+
 // --- Full fixture drive: the real recorded turn end-to-end ------------------
 
 test('fixture: the recorded read+write turn walks reading → writing → done', () => {

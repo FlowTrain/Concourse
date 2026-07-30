@@ -22,7 +22,7 @@ import os from 'node:os';
 import readline from 'node:readline';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { WebSocketServer } from 'ws';
+import { WebSocketServer, WebSocket } from 'ws';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -171,7 +171,10 @@ export function attachSessionSocket(server, hostState) {
  * @param {object} message
  */
 export function send(ws, message) {
-  if (ws.readyState === ws.OPEN) {
+  // Compare against the static constant on the imported class rather than an
+  // instance property, so the check is unambiguous regardless of how the socket
+  // was constructed.
+  if (ws.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify(message));
   }
 }
@@ -756,6 +759,18 @@ export function reduceState(state, evt) {
     }
 
     case N.TOOL_END: {
+      // Only the end of the tool currently in flight advances the machine. A
+      // TOOL_END whose id doesn't match the active tool — out-of-order arrival,
+      // a duplicate, or a replayed buffered stream (§7 reconnect) — is ignored,
+      // so it can't wrongly reset to 'thinking' or misattribute filesTouched.
+      // When either id is absent we fall back to the ordered-stream assumption.
+      if (
+        state.currentToolUseId != null &&
+        evt.toolUseId != null &&
+        evt.toolUseId !== state.currentToolUseId
+      ) {
+        return state;
+      }
       // Record the file the just-finished tool touched, then return to thinking.
       let filesTouched = state.filesTouched;
       if ((state.state === 'reading' || state.state === 'writing') && state.friendlyName) {
