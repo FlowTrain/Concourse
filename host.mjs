@@ -218,6 +218,46 @@ export function projectState(s) {
   };
 }
 
+/** Flatten a tool_result content (string, or array of blocks) to plain text. */
+function toText(content) {
+  if (content == null) return '';
+  if (typeof content === 'string') return content;
+  if (Array.isArray(content)) {
+    return content
+      .map((b) => (typeof b === 'string' ? b : b && typeof b.text === 'string' ? b.text : ''))
+      .join('');
+  }
+  return String(content);
+}
+
+/** Cap a string so one large file read can't bloat a single transcript frame. */
+function capText(s, max) {
+  if (typeof s !== 'string' || s.length <= max) return s;
+  return `${s.slice(0, max)}\n… (${s.length - max} more characters)`;
+}
+
+/**
+ * Enrich a normalised event for the transcript stream. TOOL_START gets the same
+ * friendly name (§6.3) the rail uses so the two agree; TOOL_END's raw result is
+ * flattened to text and capped. Everything else passes through untouched.
+ * @param {{ kind: string, [k: string]: any }} evt
+ * @param {string} workspaceRoot
+ */
+export function enrichEvent(evt, workspaceRoot) {
+  if (evt.kind === N.TOOL_START) {
+    const abs = evt.input && (evt.input.file_path || evt.input.notebook_path || evt.input.path);
+    if (abs) {
+      const fn = friendlyName(abs, workspaceRoot);
+      return { ...evt, friendly: fn.friendly, truePath: fn.truePath };
+    }
+    return evt;
+  }
+  if (evt.kind === N.TOOL_END) {
+    return { ...evt, content: capText(toText(evt.content), 4000) };
+  }
+  return evt;
+}
+
 /**
  * Send a JSON message over a socket if it is open. Centralised so every host→
  * browser message is serialised the same way.
@@ -447,6 +487,9 @@ export async function runTurn(hostState, prompt) {
       }
       for (const evt of normaliseEvent(raw)) {
         applyAndBroadcast(hostState, evt);
+        // The transcript is built from the event stream (§11). Enrich tool steps
+        // with the same friendly name the rail uses, so both stay consistent.
+        broadcast(hostState, { type: 'event', event: enrichEvent(evt, hostState.workspaceRoot) });
       }
     }
   } catch (err) {
@@ -582,7 +625,14 @@ function normaliseAssistant(raw) {
     if (!b || typeof b.type !== 'string') continue;
     if (b.type === 'text') {
       if (typeof b.text === 'string' && b.text.length > 0) {
-        out.push({ kind: N.NARRATION, text: b.text, partial: false, parentToolUseId });
+        out.push({ kind: N.NARRATION, channel: 'speech', text: b.text, partial: false, parentToolUseId });
+      }
+    } else if (b.type === 'thinking') {
+      // Extended-thinking block: the agent's reasoning, surfaced as narration on
+      // its own channel so the UI can present it distinctly from prose.
+      const text = typeof b.thinking === 'string' ? b.thinking : b.text;
+      if (typeof text === 'string' && text.length > 0) {
+        out.push({ kind: N.NARRATION, channel: 'thinking', text, partial: false, parentToolUseId });
       }
     } else if (b.type === 'tool_use') {
       out.push({
@@ -593,7 +643,7 @@ function normaliseAssistant(raw) {
         parentToolUseId,
       });
     }
-    // thinking / other block types: ignored.
+    // other block types: ignored.
   }
   return out;
 }
@@ -621,13 +671,13 @@ function normaliseUser(raw) {
 /** @param {RawEvent} raw */
 function normaliseStreamEvent(raw) {
   const ev = raw.event;
-  if (ev && ev.delta && ev.delta.type === 'text_delta' && typeof ev.delta.text === 'string') {
-    return [{
-      kind: N.NARRATION,
-      text: ev.delta.text,
-      partial: true,
-      parentToolUseId: raw.parent_tool_use_id ?? null,
-    }];
+  const delta = ev && ev.delta;
+  const parentToolUseId = raw.parent_tool_use_id ?? null;
+  if (delta && delta.type === 'text_delta' && typeof delta.text === 'string') {
+    return [{ kind: N.NARRATION, channel: 'speech', text: delta.text, partial: true, parentToolUseId }];
+  }
+  if (delta && delta.type === 'thinking_delta' && typeof delta.thinking === 'string') {
+    return [{ kind: N.NARRATION, channel: 'thinking', text: delta.thinking, partial: true, parentToolUseId }];
   }
   // message_start / content_block_start / message_stop / etc.: no UI event.
   return [];
