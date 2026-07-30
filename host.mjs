@@ -68,11 +68,21 @@ export function ensureWorkspace(workspaceRoot) {
  * @property {string} workspaceRoot
  * @property {string|null} sessionId  captured from SESSION_OPEN once a turn runs
  * @property {import('./host.mjs').CliEngine|null} activeEngine  the in-flight turn's engine, if any
+ * @property {Set<import('ws').WebSocket>} clients  connected browsers
+ * @property {ReturnType<typeof createInitialState>} turnState  the held reducer state
+ * @property {string|null} lastSentState  serialised last-broadcast projection (dedupe)
  */
 
 /** @returns {HostState} */
 export function createHostState(workspaceRoot) {
-  return { workspaceRoot, sessionId: null, activeEngine: null };
+  return {
+    workspaceRoot,
+    sessionId: null,
+    activeEngine: null,
+    clients: new Set(),
+    turnState: createInitialState(workspaceRoot),
+    lastSentState: null,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -111,6 +121,13 @@ export function createApp(hostState) {
     });
   });
 
+  // Fonts packaged with the app and served same-origin, so app.html pulls its
+  // typefaces locally and makes no external font request (unit 5).
+  app.use('/fonts', express.static(path.join(__dirname, 'fonts'), {
+    immutable: true,
+    maxAge: '1y',
+  }));
+
   return app;
 }
 
@@ -145,9 +162,10 @@ export function attachSessionSocket(server, hostState) {
   });
 
   wss.on('connection', (ws) => {
-    // Hello: the reducer's initial state. Everything downstream is a transition
-    // from here.
-    send(ws, { type: 'state', state: 'idle' });
+    hostState.clients.add(ws);
+    // Replay the current state so a refresh (or a second tab) lands exactly
+    // where the turn actually is, not back at idle (§7 reconnect, in miniature).
+    send(ws, { type: 'state', state: projectState(hostState.turnState) });
     send(ws, { type: 'session', sessionId: hostState.sessionId });
 
     ws.on('message', (data) => {
@@ -159,9 +177,45 @@ export function attachSessionSocket(server, hostState) {
       }
       handleClientMessage(ws, hostState, msg);
     });
+    ws.on('close', () => hostState.clients.delete(ws));
   });
 
   return wss;
+}
+
+/**
+ * Broadcast a message to every connected browser. State is host-authoritative
+ * and shared across tabs.
+ * @param {HostState} hostState
+ * @param {object} message
+ */
+export function broadcast(hostState, message) {
+  for (const ws of hostState.clients) send(ws, message);
+}
+
+/**
+ * Project the reducer state down to the fields the UI renders. Absolute paths
+ * never appear in a headline — `truePath` is carried only as a tooltip source,
+ * and host bookkeeping (workspaceRoot, currentToolUseId) is dropped. `narration`
+ * is deliberately excluded so the StatusRail doesn't re-broadcast on every token
+ * delta; streamed prose belongs to the transcript (unit 6).
+ * @param {ReturnType<typeof createInitialState>} s
+ */
+export function projectState(s) {
+  return {
+    state: s.state,
+    activity: s.activity,
+    friendlyName: s.friendlyName,
+    truePath: s.truePath,
+    filesTouched: s.filesTouched,
+    reason: s.reason,
+    detail: s.detail,
+    note: s.note,
+    turn: s.turn,
+    startedAt: s.startedAt,
+    sessionId: s.sessionId,
+    model: s.model,
+  };
 }
 
 /**
@@ -195,8 +249,8 @@ export function handleClientMessage(ws, hostState, msg) {
         // One turn at a time in v0.1. Silently drop overlapping submits.
         return;
       }
-      // Fire and forget; runTurn streams over the socket and console.
-      runTurn(ws, hostState, msg.prompt);
+      // Fire and forget; runTurn streams state to every connected browser.
+      runTurn(hostState, msg.prompt);
       break;
     case 'interrupt':
       if (hostState.activeEngine) hostState.activeEngine.interrupt();
@@ -362,35 +416,66 @@ export class CliEngine {
 }
 
 /**
- * Run one turn for a connected client. Unit 2 logs raw events to the console
- * only (per build order) and captures session_id; normalisation into UI events
- * is unit 3.
- * @param {import('ws').WebSocket} ws
+ * Run one turn. Each raw event is normalised (§5) and reduced (§6) into the
+ * host-held state, and the projected state is broadcast to every connected
+ * browser whenever it changes — this is what makes the turn legible.
  * @param {HostState} hostState
  * @param {string} prompt
  */
-export async function runTurn(ws, hostState, prompt) {
+export async function runTurn(hostState, prompt) {
   const engine = new CliEngine();
   hostState.activeEngine = engine;
+
+  // The user submitted: move to 'thinking' at once so the UI reacts before the
+  // first event lands. Date.now() lives here in the host, never in the pure
+  // reducer, so the reducer stays deterministic.
+  applyAndBroadcast(hostState, { kind: 'SUBMIT', at: Date.now() });
+
   try {
     for await (const raw of engine.start({
       prompt,
       sessionId: hostState.sessionId,
       cwd: hostState.workspaceRoot,
     })) {
-      // Unit 2: console only. This becomes normalise → reduce → ws in units 3–4.
-      console.log('[raw]', JSON.stringify(raw));
-      if (raw && typeof raw === 'object' && typeof raw.session_id === 'string') {
-        if (raw.session_id !== hostState.sessionId) {
-          hostState.sessionId = raw.session_id;
-          send(ws, { type: 'session', sessionId: hostState.sessionId });
-        }
+      if (
+        raw && typeof raw === 'object' &&
+        typeof raw.session_id === 'string' &&
+        raw.session_id !== hostState.sessionId
+      ) {
+        hostState.sessionId = raw.session_id;
+        broadcast(hostState, { type: 'session', sessionId: hostState.sessionId });
+      }
+      for (const evt of normaliseEvent(raw)) {
+        applyAndBroadcast(hostState, evt);
       }
     }
   } catch (err) {
-    console.error('[turn error]', err && err.message ? err.message : err);
+    // An unexpected host-side throw is itself a surfaced failure, not swallowed.
+    applyAndBroadcast(hostState, {
+      kind: N.HOST_ERROR,
+      reason: 'process-exit',
+      detail: String((err && err.message) || err),
+      fatal: true,
+    });
   } finally {
     hostState.activeEngine = null;
+  }
+}
+
+/**
+ * Reduce one event into the held state and broadcast the projection if it
+ * changed. Deduping on the serialised projection keeps the 85-odd token deltas
+ * of a turn from each producing a redundant frame.
+ * @param {HostState} hostState
+ * @param {{ kind: string, [k: string]: any }} evt
+ */
+function applyAndBroadcast(hostState, evt) {
+  hostState.turnState = reduceState(hostState.turnState, evt);
+  const projected = projectState(hostState.turnState);
+  const serialised = JSON.stringify(projected);
+  if (serialised !== hostState.lastSentState) {
+    hostState.lastSentState = serialised;
+    broadcast(hostState, { type: 'state', state: projected });
   }
 }
 
