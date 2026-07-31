@@ -1213,14 +1213,17 @@ export function startHost() {
   const app = createApp(hostState);
   const server = http.createServer(app);
   const wss = attachSessionSocket(server, hostState);
-  watchOutputs(hostState);
+  const watcher = watchOutputs(hostState);
+  // Close the fs watch when the server shuts down so it doesn't leak a handle
+  // (matters for tests and programmatic use of startHost()).
+  server.on('close', () => { if (watcher) watcher.close(); });
 
   server.listen(PORT, HOST, () => {
     console.log(`Concourse host listening on http://${HOST}:${PORT}`);
     console.log(`Workspace: ${workspaceRoot}`);
   });
 
-  return { server, hostState, wss };
+  return { server, hostState, wss, watcher };
 }
 
 // Only start the server when run directly (`node host.mjs` / `npm start`),

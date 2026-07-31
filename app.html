@@ -272,6 +272,7 @@
   .crumb { background: none; border: none; padding: 0; cursor: pointer; color: hsl(var(--muted-foreground)); font: inherit; }
   .crumb:hover { color: var(--primary); }
   .crumb.current { color: hsl(var(--foreground)); font-weight: 500; cursor: default; }
+  .crumb:disabled { cursor: default; opacity: 1; }
   .crumb-sep { color: hsl(var(--muted-foreground)); }
   .row {
     display: flex; align-items: center; gap: var(--space-sm);
@@ -600,7 +601,7 @@ function FileTray({ refreshKey }) {
       if (folder !== '') setFolder('');
     }
     try {
-      const r = await fetch('/api/files?path=outputs'); // 404 if the folder doesn't exist yet
+      const r = await fetch('/api/files?path=outputs'); // host creates outputs/ at startup; 404 only if it's since gone
       const list = r.ok ? (await r.json()).entries.filter((e) => e.kind === 'file') : [];
       setOutputs(list);
       const names = new Set(list.map((e) => e.name));
@@ -635,13 +636,13 @@ function FileTray({ refreshKey }) {
         <div class="tray-divider"></div>`}
 
       <div class="crumbs">
-        <button class=${'crumb' + (folder ? '' : ' current')} onClick=${() => setFolder('')}>Workspace</button>
+        <button class=${'crumb' + (folder ? '' : ' current')} disabled=${!folder} onClick=${() => setFolder('')}>Workspace</button>
         ${crumbs.map((c, i) => {
           const sub = crumbs.slice(0, i + 1).join('/');
           const isLast = i === crumbs.length - 1;
           return html`
             <span class="crumb-sep" key=${'s' + i}>/</span>
-            <button class=${'crumb' + (isLast ? ' current' : '')} onClick=${() => (isLast ? null : setFolder(sub))}>${c}</button>`;
+            <button class=${'crumb' + (isLast ? ' current' : '')} disabled=${isLast} onClick=${() => setFolder(sub)}>${c}</button>`;
         })}
       </div>
 
