@@ -71,8 +71,43 @@ test('GET /api/files lists friendly entries', async () => {
 test('GET /api/files on a subfolder drops the known extension in friendlyName', async () => {
   const res = await get('/api/files?path=outputs');
   const { entries } = await res.json();
-  assert.equal(entries[0].name, 'q3_board_deck.txt');
-  assert.equal(entries[0].friendlyName, 'Q3 Board Deck');
+  // Find by name — directory iteration order is not guaranteed across platforms.
+  const entry = entries.find((e) => e.name === 'q3_board_deck.txt');
+  assert.ok(entry, 'entry present');
+  assert.equal(entry.friendlyName, 'Q3 Board Deck');
+});
+
+test('entries are returned sorted by name', async () => {
+  const res = await get('/api/files?path=');
+  const { entries } = await res.json();
+  const names = entries.map((e) => e.name);
+  assert.deepEqual(names, [...names].sort());
+});
+
+test('a symlink/junction that escapes the workspace is hidden from listings', async (t) => {
+  const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'concourse-out-'));
+  fs.writeFileSync(path.join(outside, 'secret.txt'), 'top secret');
+  const linkDir = path.join(tmp, 'escape-link');
+  try {
+    // Junction works on Windows without privilege; POSIX gets a dir symlink.
+    try {
+      fs.symlinkSync(outside, linkDir, 'junction');
+    } catch {
+      fs.symlinkSync(outside, linkDir);
+    }
+  } catch {
+    fs.rmSync(outside, { recursive: true, force: true });
+    t.skip('neither symlink nor junction creation permitted on this platform');
+    return;
+  }
+  try {
+    const res = await get('/api/files?path=');
+    const { entries } = await res.json();
+    assert.ok(!entries.some((e) => e.name === 'escape-link'), 'escaping link is not listed');
+  } finally {
+    fs.rmSync(linkDir, { recursive: true, force: true });
+    fs.rmSync(outside, { recursive: true, force: true });
+  }
 });
 
 test('GET /api/file returns text; a folder is 400; a missing file is 404', async () => {

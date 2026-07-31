@@ -1097,31 +1097,52 @@ export class WorkspaceFs {
     return real;
   }
 
-  /** List a directory as friendly entries (§11). */
+  /** List a directory as friendly entries (§11), sorted by name for stable order. */
   list(relPath) {
     const abs = this.realResolve(relPath);
-    let dirents;
+    let names;
     try {
-      dirents = fs.readdirSync(abs, { withFileTypes: true });
+      names = fs.readdirSync(abs);
     } catch (e) {
       if (e && e.code === 'ENOTDIR') throw new WorkspaceError('That is a file, not a folder.', 400);
       throw e;
     }
-    return dirents.map((d) => {
-      const full = path.join(abs, d.name);
-      let size = 0;
-      let mtime = 0;
-      let kind = d.isDirectory() ? 'directory' : 'file';
+    const entries = [];
+    // Sort here: readdir order is not guaranteed across platforms/filesystems.
+    for (const name of names.sort()) {
+      const full = path.join(abs, name);
+      let st;
       try {
-        const st = fs.statSync(full);
-        size = st.size;
-        mtime = st.mtimeMs;
-        kind = st.isDirectory() ? 'directory' : 'file';
+        st = fs.lstatSync(full); // the entry itself, NOT the symlink target
       } catch {
-        // broken symlink or vanished entry: report the name with what we have
+        continue; // vanished between readdir and lstat
       }
-      return { name: d.name, kind, size, mtime, friendlyName: friendlyName(full, this.root).friendly };
-    });
+      if (st.isSymbolicLink()) {
+        // A symlink whose real target escapes the workspace is not part of the
+        // scoped surface — omit it entirely rather than leak the target's
+        // metadata. An in-workspace symlink is followed for kind/size/mtime.
+        let real;
+        try {
+          real = fs.realpathSync(full);
+        } catch {
+          continue; // broken symlink
+        }
+        if (escapesRoot(this.realRoot, real)) continue;
+        try {
+          st = fs.statSync(full);
+        } catch {
+          continue;
+        }
+      }
+      entries.push({
+        name,
+        kind: st.isDirectory() ? 'directory' : 'file',
+        size: st.size,
+        mtime: st.mtimeMs,
+        friendlyName: friendlyName(full, this.root).friendly,
+      });
+    }
+    return entries;
   }
 
   /** Read a file as text, capped. Returns { text, truncated, size }. */
