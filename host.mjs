@@ -426,7 +426,16 @@ export class CliEngine {
       '--output-format', 'stream-json',
       '--verbose', // stream-json requires this
       '--include-partial-messages', // token-level deltas require this
-      '--allowedTools', 'Read,Glob,Grep,Edit,Write', // conservative; no Bash
+      '--allowedTools', 'Read,Glob,Grep,Edit,Write', // conservative; no shell
+      // Explicitly DENY every shell tool. Per the permissions docs a bare tool
+      // name removes the tool from Claude's context (and `Bash` ≡ `Bash(*)`),
+      // and deny is evaluated first — it beats allow rules, acceptEdits'
+      // filesystem auto-approvals (mkdir/touch/mv/cp), any rule inherited from
+      // the user's ~/.claude (we don't pass --bare), and even hooks. Both Bash
+      // and PowerShell are denied so there's no shell on any platform. Without
+      // this, Bash leaked through. Rule 5 / §4.1 / soul.md: this audience never
+      // gets a shell — one destructive command ends the pilot.
+      '--disallowedTools', 'Bash,PowerShell',
       '--permission-mode', 'acceptEdits',
     ];
     if (sessionId) {
