@@ -427,6 +427,12 @@ export class CliEngine {
       '--verbose', // stream-json requires this
       '--include-partial-messages', // token-level deltas require this
       '--allowedTools', 'Read,Glob,Grep,Edit,Write', // conservative; no Bash
+      // Explicitly DENY Bash. Deny rules beat allow rules, beat acceptEdits'
+      // filesystem auto-approvals (mkdir/touch/mv/cp), and beat any Bash rule
+      // inherited from the user's own ~/.claude settings (we don't pass --bare).
+      // Without this, Bash leaked through. Rule 5 / §4.1 / soul.md: this
+      // audience never gets a shell — one destructive command ends the pilot.
+      '--disallowedTools', 'Bash',
       '--permission-mode', 'acceptEdits',
     ];
     if (sessionId) {
