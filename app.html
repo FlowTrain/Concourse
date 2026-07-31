@@ -127,6 +127,19 @@
   .link-dot { width: 8px; height: 8px; border-radius: var(--radius-full); background: var(--color-muted); }
   .link-dot.online { background: var(--color-success); }
 
+  /* "Continue where you left off" banner (§7) --------------------------------- */
+  .resume-banner {
+    display: flex; align-items: center; justify-content: space-between; gap: var(--space-md); flex-wrap: wrap;
+    padding: var(--space-md) var(--space-lg);
+    border-radius: var(--radius-lg);
+    background: color-mix(in srgb, var(--primary) 8%, hsl(var(--card)));
+    box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--primary) 30%, transparent);
+    font-size: var(--text-sm);
+  }
+  .resume-actions { display: flex; gap: var(--space-sm); }
+  .btn-ghost { background: transparent; color: hsl(var(--muted-foreground)); }
+  .btn-ghost:hover { background: hsl(var(--muted)); color: hsl(var(--foreground)); }
+
   /* Status rail (the primary element) --------------------------------------- */
   .rail {
     --state: var(--color-muted);
@@ -664,6 +677,7 @@ function App() {
   const [transcript, setTranscript] = useState([]);
   const [now, setNow] = useState(() => Date.now());
   const [filesRefreshKey, setFilesRefreshKey] = useState(0);
+  const [priorSession, setPriorSession] = useState(null);
   const lastStartedRef = useRef(null);
 
   const onMessage = useCallback((msg) => {
@@ -680,6 +694,8 @@ function App() {
       setTranscript((items) => applyTranscriptEvent(items, msg.event));
     } else if (msg.type === 'outputs-changed') {
       setFilesRefreshKey((k) => k + 1); // host saw outputs/ change — surface it now
+    } else if (msg.type === 'prior-session') {
+      setPriorSession(msg.session || null); // offer (or clear) "continue where you left off"
     }
     // 'session' messages are carried for later units; the rail doesn't need them.
   }, []);
@@ -716,6 +732,15 @@ function App() {
         </div>
 
         <${StatusRail} status=${status} elapsedMs=${elapsedMs} onInterrupt=${() => send({ type: 'interrupt' })} />
+
+        ${priorSession && status.state === 'idle' && html`
+          <div class="resume-banner">
+            <span>Pick up where you left off?</span>
+            <div class="resume-actions">
+              <button class="btn btn-ghost" onClick=${() => { send({ type: 'dismiss-prior' }); setPriorSession(null); }}>Start fresh</button>
+              <button class="btn btn-primary" onClick=${() => { send({ type: 'resume' }); setPriorSession(null); }}>Continue</button>
+            </div>
+          </div>`}
 
         <${Transcript} items=${transcript} />
 
