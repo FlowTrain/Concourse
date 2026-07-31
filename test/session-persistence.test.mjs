@@ -58,3 +58,35 @@ test('loadPriorSession returns null when there is no file or no usable session_i
     fs.rmSync(ws, { recursive: true, force: true });
   }
 });
+
+test('loadPriorSession coerces a tampered/partial shape so turnCount math stays numeric', () => {
+  const ws = tmpWs();
+  try {
+    fs.mkdirSync(path.join(ws, '.concourse'), { recursive: true });
+    fs.writeFileSync(
+      path.join(ws, '.concourse', 'session.json'),
+      JSON.stringify({ sessionId: 'sess-9', turnCount: '5', startedAt: 'nope' }), // wrong types
+    );
+    const prior = loadPriorSession(ws);
+    assert.equal(prior.sessionId, 'sess-9');
+    assert.equal(prior.turnCount, 0, 'non-integer turnCount coerced to 0');
+    assert.equal(prior.startedAt, null, 'non-finite startedAt coerced to null');
+    assert.equal(typeof (prior.turnCount + 1), 'number', 'turnCount stays numeric');
+  } finally {
+    fs.rmSync(ws, { recursive: true, force: true });
+  }
+});
+
+test('loadPriorSession ignores a session.json that belongs to a different workspace', () => {
+  const ws = tmpWs();
+  try {
+    fs.mkdirSync(path.join(ws, '.concourse'), { recursive: true });
+    fs.writeFileSync(
+      path.join(ws, '.concourse', 'session.json'),
+      JSON.stringify({ sessionId: 'sess-elsewhere', workspaceRoot: path.join(ws, '..', 'other-ws'), turnCount: 2 }),
+    );
+    assert.equal(loadPriorSession(ws), null);
+  } finally {
+    fs.rmSync(ws, { recursive: true, force: true });
+  }
+});

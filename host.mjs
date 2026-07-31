@@ -220,7 +220,10 @@ export function attachSessionSocket(server, hostState) {
     // startedAt it just received, then rebuilds it from these.
     for (const event of hostState.eventLog) send(ws, { type: 'event', event });
     // Offer to continue a prior session found on startup (never auto-resumed).
-    if (hostState.priorSession) send(ws, { type: 'prior-session', session: hostState.priorSession });
+    // Only the path-free view crosses to the browser; the id stays host-side.
+    if (hostState.priorSession) {
+      send(ws, { type: 'prior-session', session: publicPriorSession(hostState.priorSession) });
+    }
 
     ws.on('message', (data) => {
       let msg;
@@ -695,11 +698,32 @@ export function persistSession(hostState) {
 export function loadPriorSession(workspaceRoot) {
   try {
     const data = JSON.parse(fs.readFileSync(sessionFilePath(workspaceRoot), 'utf8'));
-    if (data && typeof data.sessionId === 'string' && data.sessionId) return data;
+    // Validate + coerce: a tampered/partial file must not poison turnCount math
+    // or offer a session that belongs to a different workspace.
+    if (!data || typeof data.sessionId !== 'string' || !data.sessionId) return null;
+    if (data.workspaceRoot && path.resolve(data.workspaceRoot) !== path.resolve(workspaceRoot)) {
+      return null; // session.json copied from elsewhere — don't offer it here
+    }
+    return {
+      sessionId: data.sessionId,
+      startedAt: Number.isFinite(data.startedAt) ? data.startedAt : null,
+      workspaceRoot,
+      turnCount: Number.isInteger(data.turnCount) && data.turnCount >= 0 ? data.turnCount : 0,
+    };
   } catch {
     // no prior session, or unreadable
   }
   return null;
+}
+
+/**
+ * The minimal, path-free view of a prior session for the browser — enough to
+ * show the banner, without leaking the absolute workspaceRoot or the id (the
+ * host keeps the id for --resume). Absolute paths never reach the UI.
+ * @param {{turnCount:number,startedAt:number|null}} prior
+ */
+function publicPriorSession(prior) {
+  return { turnCount: prior.turnCount, startedAt: prior.startedAt };
 }
 
 /** Drop the prior-session offer and tell every client to hide the banner. */
