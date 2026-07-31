@@ -72,6 +72,9 @@ export function ensureWorkspace(workspaceRoot) {
  * @property {ReturnType<typeof createInitialState>} turnState  the held reducer state
  * @property {string|null} lastSentState  serialised last-broadcast projection (dedupe)
  * @property {TranscriptSink} sink  append-only audit for the session (§10)
+ * @property {object[]} eventLog  capped current-turn events, replayed on reconnect (§7)
+ * @property {number} turnCount  turns run this session
+ * @property {{sessionId:string,startedAt:number|null,workspaceRoot:string,turnCount:number}|null} priorSession
  */
 
 /** @returns {HostState} */
@@ -84,6 +87,9 @@ export function createHostState(workspaceRoot) {
     turnState: createInitialState(workspaceRoot),
     lastSentState: null,
     sink: new TranscriptSink(workspaceRoot),
+    eventLog: [],       // capped stream of the current turn's events, for replay (§7)
+    turnCount: 0,       // turns run this session (persisted for resume)
+    priorSession: null, // a prior session found on startup, offered as "continue" (§7)
   };
 }
 
@@ -209,6 +215,15 @@ export function attachSessionSocket(server, hostState) {
     // where the turn actually is, not back at idle (§7 reconnect, in miniature).
     send(ws, { type: 'state', state: projectState(hostState.turnState) });
     send(ws, { type: 'session', sessionId: hostState.sessionId });
+    // Replay the current turn's events so a refresh restores the transcript, not
+    // just the headline state (§7). The client resets its transcript on the new
+    // startedAt it just received, then rebuilds it from these.
+    for (const event of hostState.eventLog) send(ws, { type: 'event', event });
+    // Offer to continue a prior session found on startup (never auto-resumed).
+    // Only the path-free view crosses to the browser; the id stays host-side.
+    if (hostState.priorSession) {
+      send(ws, { type: 'prior-session', session: publicPriorSession(hostState.priorSession) });
+    }
 
     ws.on('message', (data) => {
       let msg;
@@ -353,8 +368,22 @@ export function handleClientMessage(ws, hostState, msg) {
         // One turn at a time in v0.1. Silently drop overlapping submits.
         return;
       }
+      // Submitting a fresh prompt means the user chose not to resume.
+      clearPriorSession(hostState);
       // Fire and forget; runTurn streams state to every connected browser.
       runTurn(hostState, msg.prompt);
+      break;
+    case 'resume':
+      // Continue the prior session: the next turn will pass --resume <id> (§7).
+      if (hostState.priorSession && !hostState.activeEngine) {
+        hostState.sessionId = hostState.priorSession.sessionId;
+        hostState.turnCount = hostState.priorSession.turnCount || 0;
+        clearPriorSession(hostState);
+        broadcast(hostState, { type: 'session', sessionId: hostState.sessionId });
+      }
+      break;
+    case 'dismiss-prior':
+      clearPriorSession(hostState); // "start fresh"
       break;
     case 'interrupt':
       if (hostState.activeEngine) hostState.activeEngine.interrupt();
@@ -540,6 +569,11 @@ export async function runTurn(hostState, prompt) {
   hostState.activeEngine = engine;
   const sink = hostState.sink;
 
+  // A new turn: bump the counter and clear the replay log so a reconnect
+  // rebuilds THIS turn's transcript, not a jumble of prior ones (§7).
+  hostState.turnCount += 1;
+  hostState.eventLog = [];
+
   // The user submitted: audit it, then move to 'thinking' so the UI reacts
   // before the first event lands. Date.now() lives here in the host, never in
   // the pure reducer, so the reducer stays deterministic.
@@ -578,7 +612,9 @@ export async function runTurn(hostState, prompt) {
         applyAndBroadcast(hostState, evt);
         // The transcript is built from the event stream (§11). Enrich tool steps
         // with the same friendly name the rail uses, so both stay consistent.
-        broadcast(hostState, { type: 'event', event: enrichEvent(evt, hostState.workspaceRoot) });
+        const enriched = enrichEvent(evt, hostState.workspaceRoot);
+        broadcast(hostState, { type: 'event', event: enriched });
+        recordForReplay(hostState, enriched); // keep for a reconnecting client (§7)
       }
     }
   } catch (err) {
@@ -591,6 +627,9 @@ export async function runTurn(hostState, prompt) {
     });
   } finally {
     hostState.activeEngine = null;
+    // Persist the session after the turn so a host restart can offer to resume
+    // it. Best-effort — unlike the audit sink, a failure here is not fatal.
+    persistSession(hostState);
   }
 }
 
@@ -610,6 +649,88 @@ function haltForFailedAudit(hostState, engine, e) {
     fatal: true,
   });
   hostState.activeEngine = null;
+}
+
+// ---------------------------------------------------------------------------
+// Session persistence + replay (§7)
+// ---------------------------------------------------------------------------
+
+const EVENT_LOG_CAP = 500; // last N events kept in memory for reconnect replay
+
+/** Append an event to the replay log, keeping only the last EVENT_LOG_CAP. */
+function recordForReplay(hostState, event) {
+  hostState.eventLog.push(event);
+  const overflow = hostState.eventLog.length - EVENT_LOG_CAP;
+  if (overflow > 0) hostState.eventLog.splice(0, overflow);
+}
+
+const sessionFilePath = (workspaceRoot) => path.join(workspaceRoot, '.concourse', 'session.json');
+
+/**
+ * Persist the current session so a host restart can offer to continue it.
+ * Best-effort: resume is a convenience, not the audit — a failure must not halt
+ * anything (that's the sink's job, §10). No-op until a session_id exists.
+ * @param {HostState} hostState
+ */
+export function persistSession(hostState) {
+  if (!hostState.sessionId) return;
+  try {
+    fs.mkdirSync(path.join(hostState.workspaceRoot, '.concourse'), { recursive: true });
+    fs.writeFileSync(
+      sessionFilePath(hostState.workspaceRoot),
+      JSON.stringify({
+        sessionId: hostState.sessionId,
+        startedAt: hostState.turnState.startedAt,
+        workspaceRoot: hostState.workspaceRoot,
+        turnCount: hostState.turnCount,
+      }, null, 2),
+    );
+  } catch {
+    // ignore — the next turn will try again
+  }
+}
+
+/**
+ * Read a persisted session for a "continue where you left off" offer, or null
+ * if there isn't a usable one.
+ * @param {string} workspaceRoot
+ */
+export function loadPriorSession(workspaceRoot) {
+  try {
+    const data = JSON.parse(fs.readFileSync(sessionFilePath(workspaceRoot), 'utf8'));
+    // Validate + coerce: a tampered/partial file must not poison turnCount math
+    // or offer a session that belongs to a different workspace.
+    if (!data || typeof data.sessionId !== 'string' || !data.sessionId) return null;
+    if (data.workspaceRoot && path.resolve(data.workspaceRoot) !== path.resolve(workspaceRoot)) {
+      return null; // session.json copied from elsewhere — don't offer it here
+    }
+    return {
+      sessionId: data.sessionId,
+      startedAt: Number.isFinite(data.startedAt) ? data.startedAt : null,
+      workspaceRoot,
+      turnCount: Number.isInteger(data.turnCount) && data.turnCount >= 0 ? data.turnCount : 0,
+    };
+  } catch {
+    // no prior session, or unreadable
+  }
+  return null;
+}
+
+/**
+ * The minimal, path-free view of a prior session for the browser — enough to
+ * show the banner, without leaking the absolute workspaceRoot or the id (the
+ * host keeps the id for --resume). Absolute paths never reach the UI.
+ * @param {{turnCount:number,startedAt:number|null}} prior
+ */
+function publicPriorSession(prior) {
+  return { turnCount: prior.turnCount, startedAt: prior.startedAt };
+}
+
+/** Drop the prior-session offer and tell every client to hide the banner. */
+function clearPriorSession(hostState) {
+  if (!hostState.priorSession) return;
+  hostState.priorSession = null;
+  broadcast(hostState, { type: 'prior-session', session: null });
 }
 
 /**
@@ -1320,6 +1441,9 @@ export function watchOutputs(hostState) {
 export function startHost() {
   const workspaceRoot = ensureWorkspace(resolveWorkspaceRoot());
   const hostState = createHostState(workspaceRoot);
+  // A prior session from a previous run is offered as "continue where you left
+  // off" — never auto-resumed (a stale resume is confusing, §7).
+  hostState.priorSession = loadPriorSession(workspaceRoot);
   const app = createApp(hostState);
   const server = http.createServer(app);
   const wss = attachSessionSocket(server, hostState);
