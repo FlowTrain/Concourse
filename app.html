@@ -91,15 +91,28 @@
   }
   #root { min-height: 100%; display: flex; flex-direction: column; }
 
-  .page {
+  .shell {
     width: 100%;
-    max-width: 720px;
+    max-width: 1120px;
     margin: 0 auto;
     padding: var(--space-lg) var(--space-lg) var(--space-2xl);
+    flex: 1;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 300px;
+    gap: var(--space-xl);
+    align-items: start;
+  }
+  .page {
+    min-width: 0;
     display: flex;
     flex-direction: column;
     gap: var(--space-lg);
-    flex: 1;
+  }
+  /* Stay two-column down to tablet-portrait; only collapse on a phone, where a
+     300px tray would leave the conversation unusably narrow. When stacked, the
+     conversation stays on top and files sit below it. */
+  @media (max-width: 620px) {
+    .shell { grid-template-columns: 1fr; }
   }
 
   /* Masthead ---------------------------------------------------------------- */
@@ -238,6 +251,52 @@
   .step-dot.active { animation: pulse 1.5s ease-in-out infinite; }
   .step-body { flex: 1; min-width: 0; }
   .step-label { font-size: var(--text-sm); font-weight: 500; color: hsl(var(--foreground)); }
+
+  /* Right column: FileTray with the Finished/outcome box stacked below it ----- */
+  .sidecol { min-width: 0; display: flex; flex-direction: column; gap: var(--space-lg); }
+  .tray {
+    display: flex; flex-direction: column; gap: var(--space-md);
+    background: hsl(var(--card));
+    box-shadow: inset 0 0 0 1px hsl(var(--border));
+    border-radius: var(--radius-lg);
+    padding: var(--space-lg);
+  }
+  .tray-title { font-family: var(--font-display); font-weight: 500; font-size: var(--text-base); }
+  .tray-section-label {
+    font-size: var(--text-xs); font-weight: 500; letter-spacing: 0.03em; text-transform: uppercase;
+    color: hsl(var(--muted-foreground));
+  }
+  .tray-scroll { overflow-y: auto; display: flex; flex-direction: column; gap: var(--space-xs); max-height: 42vh; }
+  .tray-empty { font-size: var(--text-sm); color: hsl(var(--muted-foreground)); }
+  .crumbs { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; font-size: var(--text-sm); }
+  .crumb { background: none; border: none; padding: 0; cursor: pointer; color: hsl(var(--muted-foreground)); font: inherit; }
+  .crumb:hover { color: var(--primary); }
+  .crumb.current { color: hsl(var(--foreground)); font-weight: 500; cursor: default; }
+  .crumb-sep { color: hsl(var(--muted-foreground)); }
+  .row {
+    display: flex; align-items: center; gap: var(--space-sm);
+    padding: 6px 8px; border-radius: var(--radius-md);
+    font-size: var(--text-sm); text-align: left; width: 100%;
+    background: none; border: 1px solid transparent; cursor: default; color: hsl(var(--foreground)); font: inherit;
+  }
+  .row.clickable { cursor: pointer; }
+  .row.clickable:hover { background: hsl(var(--muted)); }
+  .row.pinned { background: color-mix(in srgb, var(--color-success) 8%, transparent); }
+  .row-icon { flex: 0 0 auto; width: 16px; text-align: center; color: hsl(var(--muted-foreground)); }
+  .row-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .row-name .friendly { font-weight: 500; }
+  .badge-new {
+    flex: 0 0 auto; font-size: 0.65rem; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase;
+    padding: 1px 6px; border-radius: var(--radius-full);
+    background: color-mix(in srgb, var(--color-success) 18%, transparent); color: var(--color-success);
+  }
+  .download {
+    flex: 0 0 auto; display: inline-flex; align-items: center; justify-content: center;
+    width: 26px; height: 26px; border-radius: var(--radius-md);
+    color: hsl(var(--muted-foreground)); text-decoration: none;
+  }
+  .download:hover { background: hsl(var(--muted)); color: var(--primary); }
+  .tray-divider { height: 1px; background: hsl(var(--border)); margin: 2px 0; }
 
   /* Composer ---------------------------------------------------------------- */
   .composer { display: flex; flex-direction: column; gap: var(--space-sm); }
@@ -495,10 +554,115 @@ function Transcript({ items }) {
     </div>`;
 }
 
+// --- FileTray: the scoped file browser with outputs/ auto-surfacing ---------
+
+const DownloadIcon = () => html`
+  <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+       stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+    <path d="M12 3v12"/><path d="m7 11 5 5 5-5"/><path d="M5 21h14"/>
+  </svg>`;
+
+function FileRow({ entry, rel, pinned, isNew }) {
+  return html`
+    <div class=${'row' + (pinned ? ' pinned' : '')}>
+      <span class="row-icon">▪</span>
+      <span class="row-name" title=${entry.name}><span class="friendly">${entry.friendlyName}</span></span>
+      ${isNew && html`<span class="badge-new">New</span>`}
+      <a class="download" href=${'/api/download?path=' + encodeURIComponent(rel)} title=${'Download ' + entry.name} download>
+        <${DownloadIcon} />
+      </a>
+    </div>`;
+}
+
+function FileTray({ refreshKey }) {
+  const [folder, setFolder] = useState('');
+  const [entries, setEntries] = useState([]);
+  const [outputs, setOutputs] = useState([]);
+  const [newNames, setNewNames] = useState(() => new Set());
+  const seenRef = useRef(null); // output names present at first load (baseline)
+
+  const load = useCallback(async () => {
+    try {
+      const r = await fetch(`/api/files?path=${encodeURIComponent(folder)}`);
+      if (r.ok) {
+        const j = await r.json();
+        setEntries(j.entries.filter((e) => !e.name.startsWith('.'))); // hide dotfiles/sidecars
+      } else {
+        // Path gone/forbidden: drop the stale listing and return to root, so a
+        // phantom folder can't be re-clicked into an ever-deeper path.
+        setEntries([]);
+        if (folder !== '') setFolder('');
+      }
+    } catch {
+      // Host unreachable (reconnecting): same safety — never keep a stale
+      // listing that lets folder navigation run away.
+      setEntries([]);
+      if (folder !== '') setFolder('');
+    }
+    try {
+      const r = await fetch('/api/files?path=outputs'); // 404 if the folder doesn't exist yet
+      const list = r.ok ? (await r.json()).entries.filter((e) => e.kind === 'file') : [];
+      setOutputs(list);
+      const names = new Set(list.map((e) => e.name));
+      if (seenRef.current === null) {
+        seenRef.current = names; // baseline — nothing is "new" on first paint
+      } else {
+        const fresh = [...names].filter((n) => !seenRef.current.has(n));
+        if (fresh.length) setNewNames((prev) => new Set([...prev, ...fresh]));
+        seenRef.current = names;
+      }
+    } catch {}
+  }, [folder]);
+
+  useEffect(() => { load(); }, [load, refreshKey]);
+
+  const folders = entries.filter((e) => e.kind === 'directory');
+  const files = entries.filter((e) => e.kind === 'file');
+  const crumbs = folder ? folder.split('/').filter(Boolean) : [];
+
+  return html`
+    <aside class="tray">
+      <div class="tray-title">Files</div>
+
+      ${outputs.length > 0 && html`
+        <div>
+          <div class="tray-section-label">Just produced</div>
+          <div class="tray-scroll" style=${{ maxHeight: '30vh' }}>
+            ${outputs.map((f) => html`
+              <${FileRow} key=${'o:' + f.name} entry=${f} rel=${'outputs/' + f.name} pinned=${true} isNew=${newNames.has(f.name)} />`)}
+          </div>
+        </div>
+        <div class="tray-divider"></div>`}
+
+      <div class="crumbs">
+        <button class=${'crumb' + (folder ? '' : ' current')} onClick=${() => setFolder('')}>Workspace</button>
+        ${crumbs.map((c, i) => {
+          const sub = crumbs.slice(0, i + 1).join('/');
+          const isLast = i === crumbs.length - 1;
+          return html`
+            <span class="crumb-sep" key=${'s' + i}>/</span>
+            <button class=${'crumb' + (isLast ? ' current' : '')} onClick=${() => (isLast ? null : setFolder(sub))}>${c}</button>`;
+        })}
+      </div>
+
+      <div class="tray-scroll">
+        ${folders.length === 0 && files.length === 0 && html`<div class="tray-empty">This folder is empty.</div>`}
+        ${folders.map((d) => html`
+          <button class="row clickable" key=${'d:' + d.name} onClick=${() => setFolder(folder ? folder + '/' + d.name : d.name)}>
+            <span class="row-icon">▸</span>
+            <span class="row-name">${d.name}</span>
+          </button>`)}
+        ${files.map((f) => html`
+          <${FileRow} key=${'f:' + f.name} entry=${f} rel=${folder ? folder + '/' + f.name : f.name} pinned=${false} isNew=${false} />`)}
+      </div>
+    </aside>`;
+}
+
 function App() {
   const [status, setStatus] = useState(IDLE_STATE);
   const [transcript, setTranscript] = useState([]);
   const [now, setNow] = useState(() => Date.now());
+  const [filesRefreshKey, setFilesRefreshKey] = useState(0);
   const lastStartedRef = useRef(null);
 
   const onMessage = useCallback((msg) => {
@@ -509,13 +673,23 @@ function App() {
         setTranscript([]);
       }
       setStatus(msg.state);
+      // When a turn finishes, refresh the tray too (a safety net if fs.watch missed).
+      if (msg.state.state === 'done') setFilesRefreshKey((k) => k + 1);
     } else if (msg.type === 'event' && msg.event) {
       setTranscript((items) => applyTranscriptEvent(items, msg.event));
+    } else if (msg.type === 'outputs-changed') {
+      setFilesRefreshKey((k) => k + 1); // host saw outputs/ change — surface it now
     }
     // 'session' messages are carried for later units; the rail doesn't need them.
   }, []);
 
   const { link, send } = useSocket(onMessage);
+
+  // Reload the file tray whenever the socket (re)connects, so a listing that
+  // failed while the host was down repopulates once it's back.
+  useEffect(() => {
+    if (link === 'open') setFilesRefreshKey((k) => k + 1);
+  }, [link]);
 
   // Tick once a second while a turn is active, to drive the live elapsed timer.
   const isActive = ACTIVE.has(status.state);
@@ -530,22 +704,27 @@ function App() {
   const busy = isActive; // composer is disabled only while a turn is running
 
   return html`
-    <div class="page">
-      <div class="masthead">
-        <div class="wordmark">Concourse</div>
-        <div class="link-status">
-          <span class=${'link-dot' + (link === 'open' ? ' online' : '')}></span>
-          ${link === 'open' ? 'Connected' : 'Reconnecting…'}
+    <div class="shell">
+      <div class="page">
+        <div class="masthead">
+          <div class="wordmark">Concourse</div>
+          <div class="link-status">
+            <span class=${'link-dot' + (link === 'open' ? ' online' : '')}></span>
+            ${link === 'open' ? 'Connected' : 'Reconnecting…'}
+          </div>
         </div>
+
+        <${StatusRail} status=${status} elapsedMs=${elapsedMs} onInterrupt=${() => send({ type: 'interrupt' })} />
+
+        <${Transcript} items=${transcript} />
+
+        <${Composer} disabled=${busy} onSubmit=${(prompt) => send({ type: 'submit', prompt })} />
       </div>
 
-      <${StatusRail} status=${status} elapsedMs=${elapsedMs} onInterrupt=${() => send({ type: 'interrupt' })} />
-
-      <${Transcript} items=${transcript} />
-
-      <${Outcome} status=${status} />
-
-      <${Composer} disabled=${busy} onSubmit=${(prompt) => send({ type: 'submit', prompt })} />
+      <div class="sidecol">
+        <${FileTray} refreshKey=${filesRefreshKey} />
+        <${Outcome} status=${status} />
+      </div>
     </div>`;
 }
 
