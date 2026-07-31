@@ -1052,6 +1052,13 @@ export function createInitialState(workspaceRoot = null) {
     startedAt: null,
     workspaceRoot,
     currentToolUseId: null,
+    // Every tool currently in flight, keyed by its toolUseId → the file it
+    // touches (or null). The rail still shows one activity (the latest tool,
+    // via currentToolUseId), but this map lets filesTouched attribute correctly
+    // when tools overlap — Claude batches parallel Reads, so a concurrent read
+    // must not be dropped from the summary. (A fuller multi-activity rail is
+    // v0.2; see the reducer single-tool-limitation note.)
+    inFlight: {},
   };
 }
 
@@ -1083,6 +1090,7 @@ export function reduceState(state, evt) {
         resultText: null,
         startedAt: evt.at ?? null,
         currentToolUseId: null,
+        inFlight: {},
       };
 
     case N.SESSION_OPEN:
@@ -1099,6 +1107,9 @@ export function reduceState(state, evt) {
     case N.TOOL_START: {
       const s = toolToState(evt.tool);
       const next = { ...state, state: s, currentToolUseId: evt.toolUseId ?? null };
+      // What file (if any) this tool touches, and how — remembered per tool id
+      // so an out-of-order/overlapping TOOL_END can still attribute it.
+      let entry = { friendlyName: null, truePath: null, action: null };
       if (s === 'reading' || s === 'writing') {
         const abs = fileOf(evt.input);
         if (abs) {
@@ -1106,6 +1117,7 @@ export function reduceState(state, evt) {
           next.friendlyName = fn.friendly;
           next.truePath = fn.truePath;
           next.activity = (s === 'reading' ? 'Reading ' : 'Editing ') + fn.friendly;
+          entry = { friendlyName: fn.friendly, truePath: fn.truePath, action: s === 'reading' ? 'read' : 'edited' };
         } else {
           next.friendlyName = null;
           next.truePath = null;
@@ -1120,30 +1132,53 @@ export function reduceState(state, evt) {
         next.truePath = null;
         next.activity = 'Working on it';
       }
+      if (evt.toolUseId != null) {
+        next.inFlight = { ...state.inFlight, [evt.toolUseId]: entry };
+      }
       return next;
     }
 
     case N.TOOL_END: {
-      // Only the end of the tool currently in flight advances the machine. A
-      // TOOL_END whose id doesn't match the active tool — out-of-order arrival,
-      // a duplicate, or a replayed buffered stream (§7 reconnect) — is ignored,
-      // so it can't wrongly reset to 'thinking' or misattribute filesTouched.
-      // When either id is absent we fall back to the ordered-stream assumption.
-      if (
-        state.currentToolUseId != null &&
-        evt.toolUseId != null &&
-        evt.toolUseId !== state.currentToolUseId
-      ) {
-        return state;
-      }
-      // Record the file the just-finished tool touched, then return to thinking.
+      const id = evt.toolUseId ?? null;
+      const isCurrent = state.currentToolUseId == null || id == null || id === state.currentToolUseId;
+      const tracked = id != null && Object.prototype.hasOwnProperty.call(state.inFlight, id);
+
+      // A TOOL_END that is neither the current tool nor a tool we saw start —
+      // a duplicate, a truly stray end, or noise — is ignored: it must not reset
+      // to 'thinking' or record a phantom file. (A concurrent tool we DID see
+      // start is `tracked`, so it still gets attributed below.)
+      if (!isCurrent && !tracked) return state;
+
+      // The file this specific tool touched, and how. Prefer the per-id record
+      // (survives overlapping tools — Claude batches parallel Reads); fall back
+      // to the rail's current file when ids are absent (ordered-stream path).
+      const entry = tracked
+        ? state.inFlight[id]
+        : ((state.state === 'reading' || state.state === 'writing') && state.friendlyName
+            ? { friendlyName: state.friendlyName, truePath: state.truePath, action: state.state === 'reading' ? 'read' : 'edited' }
+            : null);
+
+      // A tool that ended in error (a blocked write, a failed read) is NOT
+      // recorded as touched — showing "Edited" for a write that never landed
+      // would tell the user something happened that didn't (soul.md: honest
+      // legibility; §13-3: nothing swallowed). The agent's own narration still
+      // explains the block in plain language.
       let filesTouched = state.filesTouched;
-      if ((state.state === 'reading' || state.state === 'writing') && state.friendlyName) {
-        filesTouched = recordFile(filesTouched, {
-          friendlyName: state.friendlyName,
-          truePath: state.truePath,
-          action: state.state === 'reading' ? 'read' : 'edited',
-        });
+      if (!evt.isError && entry && entry.friendlyName) {
+        filesTouched = recordFile(filesTouched, entry);
+      }
+
+      let inFlight = state.inFlight;
+      if (tracked) {
+        inFlight = { ...state.inFlight };
+        delete inFlight[id];
+      }
+
+      // A non-current tool finishing while another is still active only records
+      // its file — the rail keeps showing the still-running tool. Only the
+      // current tool's end advances the machine back to thinking.
+      if (!isCurrent) {
+        return { ...state, filesTouched, inFlight };
       }
       return {
         ...state,
@@ -1153,6 +1188,7 @@ export function reduceState(state, evt) {
         truePath: null,
         currentToolUseId: null,
         filesTouched,
+        inFlight,
       };
     }
 
@@ -1435,6 +1471,45 @@ export function watchOutputs(hostState) {
 // ---------------------------------------------------------------------------
 
 /**
+ * The platform opener command + args for a URL. Windows uses cmd's `start`
+ * builtin (the empty "" is the ignored window title so a quoted URL isn't taken
+ * for one); macOS `open`; everything else `xdg-open`.
+ * @param {string} url
+ * @param {NodeJS.Platform} platform
+ * @returns {{ command: string, args: string[] }}
+ */
+export function browserOpenCommand(url, platform = process.platform) {
+  if (platform === 'win32') return { command: 'cmd', args: ['/c', 'start', '', url] };
+  if (platform === 'darwin') return { command: 'open', args: [url] };
+  return { command: 'xdg-open', args: [url] };
+}
+
+/**
+ * Open the given URL in the user's default browser (spec §13 criterion 1:
+ * `npm start` launches the host AND opens the browser — no terminal step after).
+ * Cross-platform; best-effort. Set CONCOURSE_NO_OPEN to suppress (headless runs,
+ * tests, or a user who prefers to open the tab themselves). Returns true if an
+ * opener was launched, false if suppressed or it failed.
+ * @param {string} url
+ * @param {{ env?: NodeJS.ProcessEnv, spawnFn?: typeof spawn, platform?: NodeJS.Platform }} [opts]
+ * @returns {boolean}
+ */
+export function openBrowser(url, { env = process.env, spawnFn = spawn, platform = process.platform } = {}) {
+  if (env.CONCOURSE_NO_OPEN) return false;
+  const { command, args } = browserOpenCommand(url, platform);
+  try {
+    const child = spawnFn(command, args, { detached: true, stdio: 'ignore' });
+    // Don't let a failed opener take the host down or keep the event loop alive.
+    if (child && typeof child.on === 'function') child.on('error', () => {});
+    if (child && typeof child.unref === 'function') child.unref();
+    return true;
+  } catch {
+    // Opening the browser is a convenience, never a reason to fail startup.
+    return false;
+  }
+}
+
+/**
  * Start the host: resolve config, build the app, attach the socket, listen.
  * @returns {{ server: http.Server, hostState: HostState, wss: WebSocketServer }}
  */
@@ -1453,8 +1528,10 @@ export function startHost() {
   server.on('close', () => { if (watcher) watcher.close(); });
 
   server.listen(PORT, HOST, () => {
-    console.log(`Concourse host listening on http://${HOST}:${PORT}`);
+    const url = `http://${HOST}:${PORT}`;
+    console.log(`Concourse host listening on ${url}`);
     console.log(`Workspace: ${workspaceRoot}`);
+    openBrowser(url);
   });
 
   return { server, hostState, wss, watcher };
