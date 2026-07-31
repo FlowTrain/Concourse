@@ -128,6 +128,46 @@ export function createApp(hostState) {
     maxAge: '1y',
   }));
 
+  // Scoped file surface (§11). All three endpoints route their `path` query
+  // through WorkspaceFs, which rejects any escape with 403.
+  const wsfs = new WorkspaceFs(hostState.workspaceRoot);
+  const FILE_TEXT_CAP = 1024 * 1024; // 1 MB (§11)
+
+  const sendFsError = (res, e) => {
+    if (e instanceof WorkspaceError) return res.status(e.status).json({ error: e.message });
+    return res.status(500).json({ error: 'Something went wrong reading your files.' });
+  };
+
+  app.get('/api/files', (req, res) => {
+    try {
+      res.json({ entries: wsfs.list(req.query.path) });
+    } catch (e) {
+      sendFsError(res, e);
+    }
+  });
+
+  app.get('/api/file', (req, res) => {
+    try {
+      const { text, truncated, size } = wsfs.readTextCapped(req.query.path, FILE_TEXT_CAP);
+      res
+        .set('X-Truncated', truncated ? '1' : '0')
+        .set('X-Size', String(size))
+        .type('text/plain; charset=utf-8')
+        .send(text);
+    } catch (e) {
+      sendFsError(res, e);
+    }
+  });
+
+  app.get('/api/download', (req, res) => {
+    try {
+      const abs = wsfs.fileForDownload(req.query.path);
+      res.download(abs, path.basename(abs)); // Content-Disposition: attachment
+    } catch (e) {
+      sendFsError(res, e);
+    }
+  });
+
   return app;
 }
 
@@ -992,6 +1032,141 @@ export function reduceState(state, evt) {
 
     default:
       return state;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// WorkspaceFs (§11) — the scoped file surface
+// ---------------------------------------------------------------------------
+//
+// Every client-supplied path is resolved against the workspace root and
+// rejected if it escapes — lexically (`../`, an absolute path) OR through a
+// symlink that points out of the root. This is the one security control that
+// matters in v0.1 (loopback bind covers the rest, §11), so it is deliberately
+// strict and every path endpoint is traversal-tested.
+
+/** An error carrying the HTTP status the API should answer with. */
+export class WorkspaceError extends Error {
+  constructor(message, status) {
+    super(message);
+    this.name = 'WorkspaceError';
+    this.status = status;
+  }
+}
+
+/** True if `to` is not contained within `from`. */
+function escapesRoot(from, to) {
+  const rel = path.relative(from, to);
+  return rel !== '' && (rel.startsWith('..') || path.isAbsolute(rel));
+}
+
+export class WorkspaceFs {
+  /** @param {string} workspaceRoot must already exist */
+  constructor(workspaceRoot) {
+    this.root = path.resolve(workspaceRoot);
+    // Real (symlink-resolved) root, so symlink checks compare like with like.
+    this.realRoot = fs.realpathSync(this.root);
+  }
+
+  /** Lexical containment. Throws 403 if the requested path escapes the root. */
+  resolve(relPath) {
+    if (relPath != null && typeof relPath !== 'string') {
+      throw new WorkspaceError('Invalid path.', 400);
+    }
+    const abs = path.resolve(this.root, relPath || '');
+    if (escapesRoot(this.root, abs)) {
+      throw new WorkspaceError('That location is outside your workspace.', 403);
+    }
+    return abs;
+  }
+
+  /** Lexical + symlink containment. Requires the target to exist. */
+  realResolve(relPath) {
+    const abs = this.resolve(relPath);
+    let real;
+    try {
+      real = fs.realpathSync(abs);
+    } catch (e) {
+      if (e && e.code === 'ENOENT') throw new WorkspaceError('Not found.', 404);
+      throw e;
+    }
+    if (escapesRoot(this.realRoot, real)) {
+      // a symlink inside the workspace that resolves outside it
+      throw new WorkspaceError('That location is outside your workspace.', 403);
+    }
+    return real;
+  }
+
+  /** List a directory as friendly entries (§11), sorted by name for stable order. */
+  list(relPath) {
+    const abs = this.realResolve(relPath);
+    let names;
+    try {
+      names = fs.readdirSync(abs);
+    } catch (e) {
+      if (e && e.code === 'ENOTDIR') throw new WorkspaceError('That is a file, not a folder.', 400);
+      throw e;
+    }
+    const entries = [];
+    // Sort here: readdir order is not guaranteed across platforms/filesystems.
+    for (const name of names.sort()) {
+      const full = path.join(abs, name);
+      let st;
+      try {
+        st = fs.lstatSync(full); // the entry itself, NOT the symlink target
+      } catch {
+        continue; // vanished between readdir and lstat
+      }
+      if (st.isSymbolicLink()) {
+        // A symlink whose real target escapes the workspace is not part of the
+        // scoped surface — omit it entirely rather than leak the target's
+        // metadata. An in-workspace symlink is followed for kind/size/mtime.
+        let real;
+        try {
+          real = fs.realpathSync(full);
+        } catch {
+          continue; // broken symlink
+        }
+        if (escapesRoot(this.realRoot, real)) continue;
+        try {
+          st = fs.statSync(full);
+        } catch {
+          continue;
+        }
+      }
+      entries.push({
+        name,
+        kind: st.isDirectory() ? 'directory' : 'file',
+        size: st.size,
+        mtime: st.mtimeMs,
+        friendlyName: friendlyName(full, this.root).friendly,
+      });
+    }
+    return entries;
+  }
+
+  /** Read a file as text, capped. Returns { text, truncated, size }. */
+  readTextCapped(relPath, cap) {
+    const abs = this.realResolve(relPath);
+    const st = fs.statSync(abs);
+    if (st.isDirectory()) throw new WorkspaceError('That is a folder, not a file.', 400);
+    const length = Math.min(st.size, cap);
+    const fd = fs.openSync(abs, 'r');
+    try {
+      const buf = Buffer.alloc(length);
+      fs.readSync(fd, buf, 0, length, 0);
+      return { text: buf.toString('utf8'), truncated: st.size > cap, size: st.size };
+    } finally {
+      fs.closeSync(fd);
+    }
+  }
+
+  /** Absolute real path of a file for download. Throws for a directory. */
+  fileForDownload(relPath) {
+    const abs = this.realResolve(relPath);
+    const st = fs.statSync(abs);
+    if (st.isDirectory()) throw new WorkspaceError('That is a folder, not a file.', 400);
+    return abs;
   }
 }
 
