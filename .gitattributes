@@ -1,0 +1,7 @@
+# Normalise line endings: store LF in the repo and check out LF on every
+# platform. Keeps Windows and (future) Ubuntu consistent and silences the
+# "LF will be replaced by CRLF" warning.
+* text=auto eol=lf
+
+# Binary assets — never run EOL conversion on their bytes.
+*.woff2 binary

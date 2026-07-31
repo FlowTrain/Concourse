@@ -1171,6 +1171,35 @@ export class WorkspaceFs {
 }
 
 // ---------------------------------------------------------------------------
+// outputs/ watcher (§2.1 auto-surfacing)
+// ---------------------------------------------------------------------------
+
+/**
+ * Watch the workspace `outputs/` directory and tell every browser when it
+ * changes, so a file the agent just produced surfaces in the FileTray within a
+ * couple of seconds (acceptance criterion 5) without the client polling. Fires
+ * a debounced `{type:'outputs-changed'}`; the client re-reads /api/files.
+ * @param {HostState} hostState
+ * @returns {import('node:fs').FSWatcher|null}
+ */
+export function watchOutputs(hostState) {
+  const outputsDir = path.join(hostState.workspaceRoot, 'outputs');
+  fs.mkdirSync(outputsDir, { recursive: true }); // so the watch has something to watch
+  let timer = null;
+  const notify = () => {
+    clearTimeout(timer);
+    timer = setTimeout(() => broadcast(hostState, { type: 'outputs-changed' }), 200);
+  };
+  try {
+    return fs.watch(outputsDir, { persistent: false }, notify);
+  } catch {
+    // Platform without fs.watch support: the client still refreshes when a turn
+    // ends, so files surface — just not sub-second.
+    return null;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Bootstrap
 // ---------------------------------------------------------------------------
 
@@ -1184,13 +1213,17 @@ export function startHost() {
   const app = createApp(hostState);
   const server = http.createServer(app);
   const wss = attachSessionSocket(server, hostState);
+  const watcher = watchOutputs(hostState);
+  // Close the fs watch when the server shuts down so it doesn't leak a handle
+  // (matters for tests and programmatic use of startHost()).
+  server.on('close', () => { if (watcher) watcher.close(); });
 
   server.listen(PORT, HOST, () => {
     console.log(`Concourse host listening on http://${HOST}:${PORT}`);
     console.log(`Workspace: ${workspaceRoot}`);
   });
 
-  return { server, hostState, wss };
+  return { server, hostState, wss, watcher };
 }
 
 // Only start the server when run directly (`node host.mjs` / `npm start`),

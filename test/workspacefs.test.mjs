@@ -8,7 +8,20 @@ import fs from 'node:fs';
 import os from 'node:os';
 import http from 'node:http';
 import path from 'node:path';
-import { WorkspaceFs, WorkspaceError, createHostState, createApp } from '../host.mjs';
+import { WorkspaceFs, WorkspaceError, createHostState, createApp, watchOutputs } from '../host.mjs';
+
+/** Poll `pred` until true or the timeout elapses. */
+function waitFor(pred, timeoutMs) {
+  return new Promise((resolve) => {
+    const start = Date.now();
+    const tick = () => {
+      if (pred()) return resolve(true);
+      if (Date.now() - start > timeoutMs) return resolve(false);
+      setTimeout(tick, 40);
+    };
+    tick();
+  });
+}
 
 const isWin = process.platform === 'win32';
 const outsideAbs = isWin ? 'C:\\Windows\\win.ini' : '/etc/passwd';
@@ -146,6 +159,29 @@ test('every path endpoint rejects ../ traversal with 403', async () => {
 test('an absolute path outside the workspace is rejected with 403', async () => {
   const res = await get('/api/file?path=' + encodeURIComponent(outsideAbs));
   assert.equal(res.status, 403);
+});
+
+test('watchOutputs creates outputs/ and notifies clients when a file appears there', async (t) => {
+  const ws = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'concourse-watch-')));
+  const received = [];
+  const hostState = createHostState(ws);
+  // A stand-in browser: send() only requires readyState === OPEN (1) and send().
+  hostState.clients.add({ readyState: 1, send: (d) => received.push(JSON.parse(d)) });
+
+  const watcher = watchOutputs(hostState);
+  try {
+    assert.ok(fs.existsSync(path.join(ws, 'outputs')), 'outputs/ created at watch start');
+    fs.writeFileSync(path.join(ws, 'outputs', 'report.txt'), 'hello');
+    const notified = await waitFor(() => received.some((m) => m.type === 'outputs-changed'), 3000);
+    if (!notified && !watcher) {
+      t.skip('fs.watch unsupported on this platform');
+      return;
+    }
+    assert.ok(notified, 'a file added to outputs/ broadcast outputs-changed');
+  } finally {
+    if (watcher) watcher.close();
+    fs.rmSync(ws, { recursive: true, force: true });
+  }
 });
 
 test('a symlink/junction that escapes the workspace is rejected with 403', async (t) => {
