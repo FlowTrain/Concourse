@@ -71,6 +71,7 @@ export function ensureWorkspace(workspaceRoot) {
  * @property {Set<import('ws').WebSocket>} clients  connected browsers
  * @property {ReturnType<typeof createInitialState>} turnState  the held reducer state
  * @property {string|null} lastSentState  serialised last-broadcast projection (dedupe)
+ * @property {TranscriptSink} sink  append-only audit for the session (§10)
  */
 
 /** @returns {HostState} */
@@ -82,6 +83,7 @@ export function createHostState(workspaceRoot) {
     clients: new Set(),
     turnState: createInitialState(workspaceRoot),
     lastSentState: null,
+    sink: new TranscriptSink(workspaceRoot),
   };
 }
 
@@ -536,11 +538,19 @@ export class CliEngine {
 export async function runTurn(hostState, prompt) {
   const engine = new CliEngine();
   hostState.activeEngine = engine;
+  const sink = hostState.sink;
 
-  // The user submitted: move to 'thinking' at once so the UI reacts before the
-  // first event lands. Date.now() lives here in the host, never in the pure
-  // reducer, so the reducer stays deterministic.
-  applyAndBroadcast(hostState, { kind: 'SUBMIT', at: Date.now() });
+  // The user submitted: audit it, then move to 'thinking' so the UI reacts
+  // before the first event lands. Date.now() lives here in the host, never in
+  // the pure reducer, so the reducer stays deterministic.
+  const submit = { kind: 'SUBMIT', at: Date.now(), prompt };
+  try {
+    sink.record(submit); // buffered until session_id is known
+  } catch (e) {
+    haltForFailedAudit(hostState, engine, e);
+    return;
+  }
+  applyAndBroadcast(hostState, submit); // reducer uses kind + at, ignores prompt
 
   try {
     for await (const raw of engine.start({
@@ -557,6 +567,14 @@ export async function runTurn(hostState, prompt) {
         broadcast(hostState, { type: 'session', sessionId: hostState.sessionId });
       }
       for (const evt of normaliseEvent(raw)) {
+        // Audit FIRST: the event must be durably recorded before it is surfaced.
+        // A failed write is a hard stop (§10, soul.md), never swallowed.
+        try {
+          sink.record(evt);
+        } catch (e) {
+          haltForFailedAudit(hostState, engine, e);
+          return;
+        }
         applyAndBroadcast(hostState, evt);
         // The transcript is built from the event stream (§11). Enrich tool steps
         // with the same friendly name the rail uses, so both stay consistent.
@@ -574,6 +592,24 @@ export async function runTurn(hostState, prompt) {
   } finally {
     hostState.activeEngine = null;
   }
+}
+
+/**
+ * A failed audit write is a hard stop (§10, soul.md): interrupt the turn,
+ * surface it as blocked, and stop — the work does not proceed unrecorded.
+ * @param {HostState} hostState
+ * @param {CliEngine} engine
+ * @param {unknown} e
+ */
+function haltForFailedAudit(hostState, engine, e) {
+  try { engine.interrupt(); } catch { /* best effort */ }
+  applyAndBroadcast(hostState, {
+    kind: N.HOST_ERROR,
+    reason: 'audit-write-failed',
+    detail: String((e && e.message) || e),
+    fatal: true,
+  });
+  hostState.activeEngine = null;
 }
 
 /**
@@ -868,6 +904,8 @@ function friendlyHostError(evt) {
       return "Couldn't start the assistant. It may not be installed correctly.";
     case 'process-exit':
       return 'The assistant stopped unexpectedly.';
+    case 'audit-write-failed':
+      return "Couldn't save a record of this work, so it was stopped.";
     default:
       return 'Something went wrong.';
   }
@@ -1176,6 +1214,69 @@ export class WorkspaceFs {
     const st = fs.statSync(abs);
     if (st.isDirectory()) throw new WorkspaceError('That is a folder, not a file.', 400);
     return abs;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// TranscriptSink (§10) — append-only audit
+// ---------------------------------------------------------------------------
+//
+// Every event is appended, one JSON object per line, to
+// <workspaceRoot>/.concourse/transcripts/<sessionId>.jsonl — wall-clock
+// timestamped, keyed by session_id, never rewritten and never truncated. Two
+// non-negotiables (§10, soul.md):
+//   1. Not lossy under backpressure — writes are synchronous, so an event is on
+//      disk before the turn is allowed to proceed.
+//   2. A failed audit write is a HARD STOP, not a warning — record() throws and
+//      the caller (runTurn) must halt the turn rather than swallow it.
+
+export class TranscriptSink {
+  /** @param {string} workspaceRoot */
+  constructor(workspaceRoot) {
+    this.dir = path.join(workspaceRoot, '.concourse', 'transcripts');
+    /** @type {string|null} */
+    this.sessionId = null;
+    /** @type {string[]} lines recorded before the session_id is known */
+    this.pending = [];
+  }
+
+  /**
+   * Append one event to the session's transcript. The SUBMIT precedes
+   * SESSION_OPEN on the first turn, so events are buffered until the session_id
+   * is known, then flushed in order. Throws if a write fails — the caller must
+   * treat that as a hard stop.
+   * @param {{ kind: string, [k: string]: any }} event
+   */
+  record(event) {
+    const line = JSON.stringify({ ts: new Date().toISOString(), ...event });
+    // Capture the session id off SESSION_OPEN and flush anything buffered first,
+    // so the on-disk order is exactly the event order.
+    if (event.kind === N.SESSION_OPEN && typeof event.sessionId === 'string' && event.sessionId) {
+      if (this.sessionId !== event.sessionId) {
+        this.sessionId = event.sessionId;
+        const buffered = this.pending;
+        this.pending = [];
+        for (const b of buffered) this._appendLine(b);
+      }
+    }
+    if (this.sessionId) {
+      this._appendLine(line);
+    } else {
+      this.pending.push(line);
+    }
+  }
+
+  /** @param {string} line */
+  _appendLine(line) {
+    // Synchronous + append-only: the event is durable before we continue, and a
+    // failure propagates (hard stop) instead of being swallowed.
+    fs.mkdirSync(this.dir, { recursive: true });
+    fs.appendFileSync(path.join(this.dir, `${this.sessionId}.jsonl`), `${line}\n`);
+  }
+
+  /** The transcript file for the current session, or null before it's known. */
+  currentPath() {
+    return this.sessionId ? path.join(this.dir, `${this.sessionId}.jsonl`) : null;
   }
 }
 
