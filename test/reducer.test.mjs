@@ -173,6 +173,77 @@ test('a TOOL_END that does not match the active tool is ignored (out-of-order / 
   assert.deepEqual(done.filesTouched, [{ friendlyName: 'A', truePath: path.join(ws, 'a.txt'), action: 'read' }]);
 });
 
+test('a tool that ends in error is NOT recorded as touched (blocked write ≠ "Edited")', () => {
+  const ws = path.resolve('/ws');
+  let s = reduceState(createInitialState(ws), submit());
+  s = reduceState(s, { kind: N.TOOL_START, tool: 'Write', toolUseId: 'w1', input: { file_path: path.join(ws, 'outputs', 'summary.md') } });
+  assert.equal(s.state, 'writing');
+  assert.equal(s.friendlyName, 'Summary');
+
+  // The write was blocked by a permission check → TOOL_END isError:true.
+  const ended = reduceState(s, { kind: N.TOOL_END, toolUseId: 'w1', isError: true });
+  assert.equal(ended.state, 'thinking'); // the agent keeps going / narrates
+  assert.deepEqual(ended.filesTouched, [], 'a blocked write must not appear as a touched file');
+
+  // A failed read is likewise not recorded.
+  let r = reduceState(createInitialState(ws), submit());
+  r = reduceState(r, { kind: N.TOOL_START, tool: 'Read', toolUseId: 'r1', input: { file_path: path.join(ws, 'missing.md') } });
+  r = reduceState(r, { kind: N.TOOL_END, toolUseId: 'r1', isError: true });
+  assert.deepEqual(r.filesTouched, []);
+});
+
+test('concurrent tool calls: every read is attributed, even when ends interleave', () => {
+  // Reproduces the §13 finding: Claude batches parallel Reads, so two are in
+  // flight at once and one end arrives while another tool is still current.
+  const ws = path.resolve('/ws');
+  let s = reduceState(createInitialState(ws), submit());
+  const p = (n) => path.join(ws, `${n}.md`);
+
+  s = reduceState(s, { kind: N.TOOL_START, tool: 'Read', toolUseId: 'v', input: { file_path: p('vision') } });
+  s = reduceState(s, { kind: N.TOOL_END, toolUseId: 'v', isError: false });
+  // Two reads now in flight; 'risks' becomes the current tool.
+  s = reduceState(s, { kind: N.TOOL_START, tool: 'Read', toolUseId: 'a', input: { file_path: p('audience') } });
+  s = reduceState(s, { kind: N.TOOL_START, tool: 'Read', toolUseId: 'r', input: { file_path: p('risks') } });
+  assert.equal(s.friendlyName, 'Risks'); // rail shows the latest tool
+  // The non-current tool ('audience') ends first — it must still be recorded,
+  // and the rail must stay 'reading' (risks is still running).
+  s = reduceState(s, { kind: N.TOOL_END, toolUseId: 'a', isError: false });
+  assert.equal(s.state, 'reading');
+  assert.equal(s.friendlyName, 'Risks');
+  // The current tool ends → back to thinking.
+  s = reduceState(s, { kind: N.TOOL_END, toolUseId: 'r', isError: false });
+  assert.equal(s.state, 'thinking');
+
+  const touched = s.filesTouched.map((f) => f.friendlyName).sort();
+  assert.deepEqual(touched, ['Audience', 'Risks', 'Vision'], 'no concurrently-read file is dropped');
+});
+
+test('concurrent tools: current tool ends first → rail stays on the still-running tool, not idle', () => {
+  // The opposite interleaving (Copilot PR #17): the last-started read finishes
+  // before an earlier one. The rail must not flip to "thinking" while a read is
+  // still in flight, and currentToolUseId must not be left dangling.
+  const ws = path.resolve('/ws');
+  let s = reduceState(createInitialState(ws), submit());
+  const p = (n) => path.join(ws, `${n}.md`);
+
+  s = reduceState(s, { kind: N.TOOL_START, tool: 'Read', toolUseId: 'a', input: { file_path: p('audience') } });
+  s = reduceState(s, { kind: N.TOOL_START, tool: 'Read', toolUseId: 'r', input: { file_path: p('risks') } });
+  assert.equal(s.currentToolUseId, 'r'); // latest-started is current
+
+  // The current tool ('risks') ends first, while 'audience' is still running.
+  s = reduceState(s, { kind: N.TOOL_END, toolUseId: 'r', isError: false });
+  assert.equal(s.state, 'reading', 'still reading — audience is in flight');
+  assert.equal(s.activity, 'Reading Audience');
+  assert.equal(s.friendlyName, 'Audience');
+  assert.equal(s.currentToolUseId, 'a', 'rail re-points to the still-running tool');
+
+  // Now the last tool ends → back to thinking, both files recorded.
+  s = reduceState(s, { kind: N.TOOL_END, toolUseId: 'a', isError: false });
+  assert.equal(s.state, 'thinking');
+  assert.equal(s.currentToolUseId, null);
+  assert.deepEqual(s.filesTouched.map((f) => f.friendlyName).sort(), ['Audience', 'Risks']);
+});
+
 // --- Full fixture drive: the real recorded turn end-to-end ------------------
 
 test('fixture: the recorded read+write turn walks reading → writing → done', () => {
