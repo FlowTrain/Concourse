@@ -6,7 +6,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { normaliseEvent, enrichEvent, redactWorkspacePaths, N } from '../host.mjs';
+import { normaliseEvent, enrichEvent, redactWorkspacePaths, collapseAbsolutePaths, N } from '../host.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const FIXTURE = path.join(__dirname, '..', 'fixtures', 'session-readwrite.ndjson');
@@ -220,6 +220,27 @@ test('redactWorkspacePaths turns a bare root into a plain-language token and tol
   assert.equal(redactWorkspacePaths('saved under C:\\a\\ws', 'C:\\a\\ws'), 'saved under the workspace');
   assert.equal(redactWorkspacePaths(null, '/x'), null);
   assert.equal(redactWorkspacePaths('unchanged', null), 'unchanged');
+});
+
+test('redactWorkspacePaths collapses an absolute path OUTSIDE the workspace to its file name', () => {
+  // The real leak (§13 poke): the CLI reported a write into the user's ~/.claude
+  // area, well outside the workspace, so the workspace strip never touched it.
+  const ws = 'C:\\Users\\Jane\\project';
+  const msg = 'File created successfully at: C:\\Users\\Jane\\.claude\\projects\\C--Users-Jane-project\\memory\\MEMORY.md (done)';
+  const out = redactWorkspacePaths(msg, ws);
+  assert.equal(out, 'File created successfully at: MEMORY.md (done)');
+  assert.ok(!out.includes('C:\\'), 'no absolute path remains');
+  assert.ok(!out.includes('Users'), 'home-dir layout not leaked');
+});
+
+test('collapseAbsolutePaths: windows / UNC / posix paths → basename; urls and relative paths untouched', () => {
+  assert.equal(collapseAbsolutePaths('at C:/a/b/report.md now'), 'at report.md now');
+  assert.equal(collapseAbsolutePaths('see \\\\server\\share\\deck.pptx'), 'see deck.pptx');
+  assert.equal(collapseAbsolutePaths('wrote /Users/jane/notes/final.md ok'), 'wrote final.md ok');
+  // A workspace-relative path (already stripped) is not absolute → left alone.
+  assert.equal(collapseAbsolutePaths('outputs/summary.md'), 'outputs/summary.md');
+  // URLs must survive (the posix branch must not eat the path part).
+  assert.equal(collapseAbsolutePaths('see https://docs.example.com/a/b/c'), 'see https://docs.example.com/a/b/c');
 });
 
 test('unknown / malformed events are tolerated and emit nothing', () => {

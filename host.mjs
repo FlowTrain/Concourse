@@ -304,14 +304,46 @@ function capText(s, max) {
  * @param {string|null} workspaceRoot
  */
 export function redactWorkspacePaths(text, workspaceRoot) {
-  if (typeof text !== 'string' || !workspaceRoot) return text;
-  const roots = [workspaceRoot, workspaceRoot.replace(/\\/g, '/'), workspaceRoot.replace(/\//g, '\\')];
+  if (typeof text !== 'string') return text;
   let out = text;
-  for (const r of roots) {
-    if (!r) continue;
-    out = out.split(`${r}\\`).join('').split(`${r}/`).join('').split(r).join('the workspace');
+  if (workspaceRoot) {
+    const roots = [workspaceRoot, workspaceRoot.replace(/\\/g, '/'), workspaceRoot.replace(/\//g, '\\')];
+    for (const r of roots) {
+      if (!r) continue;
+      out = out.split(`${r}\\`).join('').split(`${r}/`).join('').split(r).join('the workspace');
+    }
   }
-  return out;
+  // A path OUTSIDE the workspace (the CLI can report one — e.g. a write into the
+  // user's home/.claude area) still leaks the machine's directory layout. Any
+  // absolute path that survived the workspace strip is collapsed to just its
+  // file name, so the raw detail stays legible without an absolute path ever
+  // reaching the UI (CLAUDE.md: absolute paths never reach the UI, not even
+  // behind the closed disclosure).
+  return collapseAbsolutePaths(out);
+}
+
+/**
+ * Replace any absolute filesystem path in `text` with just its file name.
+ * Handles Windows drive paths (`C:\…`, `C:/…`), UNC paths (`\\server\…`), and
+ * multi-segment POSIX paths (`/Users/…`), while leaving URLs and already
+ * workspace-relative paths untouched.
+ * @param {string} text
+ * @returns {string}
+ */
+export function collapseAbsolutePaths(text) {
+  if (typeof text !== 'string') return text;
+  const basename = (m) => m.split(/[\\/]/).filter(Boolean).pop() || m;
+  return text
+    // Windows drive path: C:\Users\… or C:/Users/… . The drive letter must be a
+    // single letter at a boundary — the negative lookbehind stops this matching
+    // the "s:" inside "https://…".
+    .replace(/(?<![A-Za-z])[A-Za-z]:[\\/][^\s"'<>|]*/g, basename)
+    // UNC path: \\server\share\…
+    .replace(/\\\\[^\s"'<>|]+/g, basename)
+    // POSIX absolute path with 2+ segments, but not the path part of a URL
+    // (the lookbehind rejects a leading slash preceded by ':' , '/' or a word
+    // char, which is what "http://host/a/b" looks like).
+    .replace(/(?<![:/\w])\/(?:[^\s"'<>|/]+\/)+[^\s"'<>|/]*/g, basename);
 }
 
 /**
