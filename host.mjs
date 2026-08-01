@@ -1138,34 +1138,43 @@ export function reduceState(state, evt) {
 
     case N.TOOL_START: {
       const s = toolToState(evt.tool);
-      const next = { ...state, state: s, currentToolUseId: evt.toolUseId ?? null };
-      // What file (if any) this tool touches, and how — remembered per tool id
-      // so an out-of-order/overlapping TOOL_END can still attribute it.
-      let entry = { friendlyName: null, truePath: null, action: null };
+      let friendly = null;
+      let truePath = null;
+      let action = null;
+      let activity;
       if (s === 'reading' || s === 'writing') {
         const abs = fileOf(evt.input);
         if (abs) {
           const fn = friendlyName(abs, state.workspaceRoot);
-          next.friendlyName = fn.friendly;
-          next.truePath = fn.truePath;
-          next.activity = (s === 'reading' ? 'Reading ' : 'Editing ') + fn.friendly;
-          entry = { friendlyName: fn.friendly, truePath: fn.truePath, action: s === 'reading' ? 'read' : 'edited' };
+          friendly = fn.friendly;
+          truePath = fn.truePath;
+          activity = (s === 'reading' ? 'Reading ' : 'Editing ') + fn.friendly;
+          action = s === 'reading' ? 'read' : 'edited';
         } else {
-          next.friendlyName = null;
-          next.truePath = null;
-          next.activity = s === 'reading' ? 'Looking through your files' : 'Saving your changes';
+          activity = s === 'reading' ? 'Looking through your files' : 'Saving your changes';
         }
       } else if (s === 'running') {
-        next.friendlyName = null;
-        next.truePath = null;
-        next.activity = 'Running a command';
+        activity = 'Running a command';
       } else {
-        next.friendlyName = null;
-        next.truePath = null;
-        next.activity = 'Working on it';
+        activity = 'Working on it';
       }
+      const next = {
+        ...state,
+        state: s,
+        activity,
+        friendlyName: friendly,
+        truePath,
+        currentToolUseId: evt.toolUseId ?? null,
+      };
+      // Remember the whole rail snapshot for this tool id, so an overlapping
+      // TOOL_END can still attribute the file AND — when the current tool ends
+      // first — the rail can drop back onto a tool that's still running instead
+      // of falsely going idle.
       if (evt.toolUseId != null) {
-        next.inFlight = { ...state.inFlight, [evt.toolUseId]: entry };
+        next.inFlight = {
+          ...state.inFlight,
+          [evt.toolUseId]: { state: s, activity, friendlyName: friendly, truePath, action },
+        };
       }
       return next;
     }
@@ -1197,7 +1206,13 @@ export function reduceState(state, evt) {
       // explains the block in plain language.
       let filesTouched = state.filesTouched;
       if (!evt.isError && entry && entry.friendlyName) {
-        filesTouched = recordFile(filesTouched, entry);
+        // Only the file fields — not the rail snapshot (state/activity) the
+        // inFlight entry also carries.
+        filesTouched = recordFile(filesTouched, {
+          friendlyName: entry.friendlyName,
+          truePath: entry.truePath,
+          action: entry.action,
+        });
       }
 
       let inFlight = state.inFlight;
@@ -1207,10 +1222,29 @@ export function reduceState(state, evt) {
       }
 
       // A non-current tool finishing while another is still active only records
-      // its file — the rail keeps showing the still-running tool. Only the
-      // current tool's end advances the machine back to thinking.
+      // its file — the rail keeps showing the still-running (current) tool.
       if (!isCurrent) {
         return { ...state, filesTouched, inFlight };
+      }
+      // The current tool ended. If other tools are still in flight (Claude can
+      // finish the last-started read before an earlier one), keep the rail on a
+      // still-running tool — the most recently started — rather than lying that
+      // it's idle. Only when nothing is left do we return to thinking. (Showing
+      // ALL of them at once — "Reading 2 files" — is the v0.2 rail work.)
+      const remaining = Object.keys(inFlight);
+      if (remaining.length > 0) {
+        const nextId = remaining[remaining.length - 1];
+        const e = inFlight[nextId];
+        return {
+          ...state,
+          state: e.state,
+          activity: e.activity,
+          friendlyName: e.friendlyName,
+          truePath: e.truePath,
+          currentToolUseId: nextId,
+          filesTouched,
+          inFlight,
+        };
       }
       return {
         ...state,
