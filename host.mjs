@@ -996,17 +996,22 @@ const DOC_EXTS = new Set([
  */
 export function friendlyName(absPath, workspaceRoot) {
   const truePath = absPath;
+  // Detect Windows-style paths so the correct path module is used on any OS.
+  // path.win32 is available on all platforms (Node ships both).
+  const isWinPath = /^[A-Za-z]:[/\\]/.test(absPath) ||
+    (workspaceRoot != null && /^[A-Za-z]:[/\\]/.test(workspaceRoot));
+  const p = isWinPath ? path.win32 : path;
   let rel;
   try {
-    rel = workspaceRoot ? path.relative(workspaceRoot, absPath) : absPath;
+    rel = workspaceRoot ? p.relative(workspaceRoot, absPath) : absPath;
   } catch {
     rel = absPath;
   }
   // If it escapes the workspace or isn't relative, fall back to the file name.
-  if (!rel || rel.startsWith('..') || path.isAbsolute(rel)) {
-    rel = path.basename(absPath);
+  if (!rel || rel.startsWith('..') || p.isAbsolute(rel)) {
+    rel = p.basename(absPath);
   }
-  let base = path.basename(rel);
+  let base = p.basename(rel);
   const dot = base.lastIndexOf('.');
   if (dot > 0 && DOC_EXTS.has(base.slice(dot + 1).toLowerCase())) {
     base = base.slice(0, dot);
